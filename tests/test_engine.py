@@ -34,6 +34,12 @@ def test_pick_rule_prefers_item_specific():
     assert pick_rule([], "123") is None
 
 
+def test_render_permanent_card_text():
+    assert render("有效期 {days} 天", days=0) == "有效期 永久"
+    assert render("有效期：{days}", days=0) == "有效期：永久"
+    assert render("有效期 {days} 天", days=30) == "有效期 30 天"
+
+
 def test_render_substitutes_variables():
     out = render("卡密：{card}\n订单：{order_id}\n买家：{buyer}",
                  buyer_name="小王", order_id="123", card="ABC")

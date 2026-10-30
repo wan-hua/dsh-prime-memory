@@ -349,6 +349,22 @@ async def test_frame_paid_card_does_not_auto_reply(db, fast_reply):
     assert worker.client.sent == []
 
 
+@pytest.mark.parametrize("content", [
+    "[卡片消息]\n去查看\n买家已确认收货，交易成功",
+    "[我完成了评价]\n查看评价",
+    "快给ta一个评价吧～\n去评价",
+    "[买家确认收货，交易成功]\n买家已确认收货，交易成功",
+])
+async def test_system_trade_messages_do_not_auto_reply(db, fast_reply, content):
+    """收货/评价类系统消息只记流水和社交动作，不能触发自动回复。"""
+    worker = await build_worker(db)
+    await save_reply_rule(db, kind="item")
+    await worker._on_frame(frame_with(chat_payload(content)))
+    for task in list(worker._reply_tasks):
+        await task
+    assert worker.client.sent == []
+
+
 async def test_worker_dry_run_does_not_send(db, fast_reply, monkeypatch):
     monkeypatch.setattr(settings, "dry_run", True)
     worker = await build_worker(db)

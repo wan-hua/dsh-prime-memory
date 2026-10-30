@@ -12,23 +12,34 @@ from .autoreply import AutoReplyEngine, ReplyDecision
 from .client import CookieExpired, RiskControl, TokenExpired, XianyuClient, XianyuError
 from .codec import (
     IncomingMessage,
+    buyer_id_from_order,
     buyer_nick_from_order,
     frame_shape,
     is_guide_payload,
     is_ignored,
     is_paid_trigger,
     is_placeholder_name,
+    is_trade_content,
     note_unparsed,
     parse_message,
     pick_display_name,
     sync_payloads_detailed,
     unread_sync_chat_id,
 )
-from .config import settings, upstream_ready
+from .config import k2018_ready, settings, social_any_enabled
 from .db import Database
-from .engine import AUTH_BLOCKED_REASON, DeliveryEngine, quota_from_amount, render
+from .engine import (
+    AUTH_BLOCKED_REASON,
+    DeliveryEngine,
+    days_from_amount,
+    parse_price_tiers,
+    pick_price_tier,
+    render,
+)
+from .minidaily import MiniDailyClient, MiniDailyError, MiniDailyInvite
 from .money import AmountError, amount_from_order_item, pick_amount
-from .upstream import Provisioner, UpstreamError, build_card_label
+from .social import SocialAutomation, social_event
+from .upstream import Provisioned, Provisioner, UpstreamError, build_card_label
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +47,8 @@ logger = logging.getLogger(__name__)
 BACKOFF = (5, 10, 30, 60, 120)
 #: 风控/滑块不是 Cookie 失效，退避要更长，避免把账号越撞越黑
 RISK_BACKOFF = (60, 180, 300, 600, 900)
+#: 2018K 建卡/查单失败后的重试间隔（秒）；只重试一次，避免连续请求触发上游防护
+PROVISION_RETRY_DELAY = 10.0
 
 
 def _preview(text: str, limit: int = 120) -> str:
@@ -44,6 +57,17 @@ def _preview(text: str, limit: int = 120) -> str:
     if len(one_line) <= limit:
         return one_line
     return one_line[:limit] + f"…（共 {len(one_line)} 字）"
+
+
+def _epoch_ms(value: Any) -> int:
+    """把秒/毫秒时间戳统一成毫秒；解析不了返回 0。"""
+    try:
+        number = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    if 0 < number < 10**12:
+        number *= 1000
+    return number
 
 
 class AccountWorker:
@@ -243,6 +267,7 @@ class AccountWorker:
                 if self._msg_poll_task is not None:
                     self._msg_poll_task.cancel()
                     self._msg_poll_task = None
+
         finally:
             # 连上不到 20 秒就断、且一帧都没收到：大概率是 token/设备不匹配，
             # 清掉缓存，别让下一次重连继续用同一个坏 token。
@@ -428,9 +453,20 @@ class AccountWorker:
                 return None
             await self.db.mark_messages_seen(self.account_id, [seen_key])
 
+        # 旧会话保护：推送通道也可能补发很久以前的消息。
+        # 超过保护窗口的消息只当没看见，不记流水、不自动回复、不触发发货。
+        if self._is_stale_message(msg.created_at):
+            logger.debug("[%s] 忽略超过旧会话保护期的消息：%s", self.name, seen_key)
+            return None
+
+        # 这些系统交易消息（收货、评价、确认卡片）只做流水/社交动作，
+        # 绝不能命中商品或关键词自动回复，免得给买家回一句「在的」。
+        if msg.is_system_card or is_trade_content(msg.content):
+            allow_auto_reply = False
+
         # 交易卡片本身不带昵称（reminderTitle 是「等待你发货」这类标题），
         # 先按「聊天记录」把真名找回来，再落库 —— 顺序反了的话这条流水
-        # 会永久停在「买家」上，而 new-api 的令牌名正是拿它拼的。
+        # 会永久停在「买家」上，而 2018K 的卡密备注正是拿它拼的。
         await self._resolve_buyer_name(msg)
 
         await self.db.log_message(
@@ -442,7 +478,9 @@ class AccountWorker:
             order_id=msg.order_id,
             content=msg.content,
             kind="incoming",
+            msg_type="trade" if (msg.is_system_card or is_trade_content(msg.content)) else "chat",
         )
+        await self._handle_social_event(msg)
         if is_ignored(msg.content):
             logger.debug("[%s] 忽略系统消息：%s", self.name, msg.content)
             return None
@@ -486,6 +524,33 @@ class AccountWorker:
         await self._deliver(msg, decision)
         return reply_task
 
+    @staticmethod
+    def _is_stale_message(created_at: Any) -> bool:
+        """消息本身是否已经超过旧会话保护窗口；0/无时间戳不在这里拦截。"""
+        seconds = max(0, int(settings.message_stale_seconds))
+        if not seconds:
+            return False
+        timestamp = _epoch_ms(created_at)
+        if not timestamp:
+            return False
+        return int(time.time() * 1000) - timestamp > seconds * 1000
+
+    async def _handle_social_event(self, msg: IncomingMessage) -> None:
+        """用系统交易消息触发求花/提醒/评价，不做订单轮询。"""
+        if not social_any_enabled() or not msg.order_id:
+            return
+        event = social_event(msg.content, msg.is_system_card)
+        if not event:
+            return
+        try:
+            await SocialAutomation(
+                self.db, self.client, self.account_id, self.name
+            ).on_event(msg.order_id, event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[%s] 订单 %s 社交动作失败：%s", self.name, msg.order_id, exc)
+
     async def _resolve_buyer_name(self, msg: IncomingMessage) -> None:
         """把「买家」这种占位名换成真昵称；换到了就把历史流水一起纠正。
 
@@ -495,10 +560,15 @@ class AccountWorker:
         """
         if is_placeholder_name(msg.sender_name):
             known = await self.db.known_buyer_name(self.account_id, msg.sender_id)
-            if not known:
+            if known:
+                msg.sender_name = known
+                logger.debug("[%s] 买家 %s 的昵称补全为 %s", self.name, msg.sender_id, known)
+            elif msg.order_id and (msg.is_system_card or is_trade_content(msg.content)):
+                # 交易卡片/收货提醒的 sender_id 可能是通知服务号，不能只靠它。
+                # 订单详情里有权威的买家昵称和买家 ID，按订单补一次。
+                await self._name_from_cached_order(msg, fetch=True)
+            if is_placeholder_name(msg.sender_name):
                 return
-            msg.sender_name = known
-            logger.debug("[%s] 买家 %s 的昵称补全为 %s", self.name, msg.sender_id, known)
         await self._remember_buyer_name(msg.sender_id, msg.sender_name)
 
     async def _repair_placeholder_names(self) -> None:
@@ -538,9 +608,21 @@ class AccountWorker:
         nick = buyer_nick_from_order(order)
         if not nick:
             return
+        buyer_id = buyer_id_from_order(order)
+        if buyer_id and (msg.is_system_card or is_trade_content(msg.content)):
+            # 同一笔交易的卡片可能来自不同通知服务号；统一成真实买家 ID，
+            # 消息流水才能按用户聚合，而不是把一张卡当成一个人。
+            msg.sender_id = buyer_id
         msg.sender_name = nick
         logger.info("[%s] 买家 %s 的昵称从订单补全为 %s", self.name, msg.sender_id, nick)
         await self._remember_buyer_name(msg.sender_id, nick)
+        if msg.order_id:
+            changed = await self.db.backfill_buyer_name_by_order(
+                self.account_id, msg.order_id, nick, buyer_id=buyer_id
+            )
+            if changed:
+                logger.info("[%s] 订单 %s 的买家名已按订单回填 %s 条记录",
+                            self.name, msg.order_id, changed)
 
     async def _name_from_cached_order(self, msg: IncomingMessage, *, fetch: bool = False) -> None:
         """用订单详情补昵称；默认只捡缓存里的那份。
@@ -682,20 +764,35 @@ class AccountWorker:
         seeking_baseline = not self._message_baseline_done
         seen = await self.db.messages_seen(self.account_id, keys)
 
+        # 旧会话保护：会话最后一条消息已经超过保护窗口，就整段忽略。
+        # 不拉历史、不记流水、不自动回复，更不进入发货判断。
+        now_ms = int(time.time() * 1000)
+        stale_seconds = max(0, int(settings.message_stale_seconds))
+        stale_before = now_ms - stale_seconds * 1000 if stale_seconds else 0
+
         baseline_keys: list[str] = []
+        stale_keys: list[str] = []
         todo: list[dict[str, Any]] = []
         for conv, key in zip(conversations, keys, strict=True):
             if key in seen:
                 continue
+            last_at = _epoch_ms(conv.get("created_at"))
+            if stale_before and (not last_at or last_at < stale_before):
+                stale_keys.append(key)
+                continue
             # 第一轮：比「本连接建立时刻」更早的都是历史消息，只记已读不回。
             # 用时间而不是「第一轮全跳过」，才不会漏掉启动瞬间刚到达的那条。
-            if seeking_baseline and int(conv.get("created_at") or 0) < self._connected_at_ms:
+            if seeking_baseline and last_at < self._connected_at_ms:
                 baseline_keys.append(key)
                 continue
             todo.append(conv)
 
         if baseline_keys:
             await self.db.mark_messages_seen(self.account_id, baseline_keys)
+        if stale_keys:
+            await self.db.mark_messages_seen(self.account_id, stale_keys)
+            logger.info("[%s] 跳过 %s 个超过旧会话保护期的会话（最后消息早于 %s 秒前）",
+                        self.name, len(stale_keys), stale_seconds)
         if seeking_baseline:
             self._message_baseline_done = True
             logger.info("[%s] 已建立会话基线（%s 个会话），只处理这之后的新消息",
@@ -706,6 +803,9 @@ class AccountWorker:
         # 基线那一轮：比连接时刻更早的历史消息不处理（否则一启动就把旧消息全回一遍）。
         # 之后各轮只靠 messageId 去重 —— 那时「早于连接时刻」也可能是一条没见过的消息。
         min_created_at = self._connected_at_ms if seeking_baseline else 0
+        if stale_before:
+            # 即使会话最后一条是新消息，历史补拉里夹带的旧消息也不能处理
+            min_created_at = max(min_created_at, stale_before)
 
         # 拉历史是一次 WS 往返，会话多的时候别一次打十几个出去：
         # 优先给「最新有动静」的几个会话补历史，其余只用列表里的最后一条。
@@ -1013,7 +1113,7 @@ class AccountWorker:
 
         return await self._deliver(msg, decision, claimed=True)
 
-    async def _find_order_cached(self, order_id: str) -> dict[str, Any] | None:
+    async def _find_order_cached(self, order_id: str, *, fresh: bool = False) -> dict[str, Any] | None:
         """查订单详情，同一个订单在 TTL 内只查一次。
 
         一单要查两次：付款卡片只带 orderId 时先补商品 ID，上游模式再取金额。
@@ -1022,7 +1122,7 @@ class AccountWorker:
         if self.client is None:
             return None
         ttl = settings.order_cache_ttl
-        if ttl > 0:
+        if ttl > 0 and not fresh:
             cached = self._order_cache.get(order_id)
             if cached is not None and (time.monotonic() - cached[0]) < ttl:
                 return cached[1]
@@ -1175,49 +1275,105 @@ class AccountWorker:
 
         card_code = decision.card_code
         amount_cny = decision.amount_cny
-        quota_usd = decision.quota_usd
+        days = decision.days
         content = decision.content
+        software_id = str(rule.get("software_id") or "")
+        provisioned: Provisioned | None = None
+        invite: MiniDailyInvite | None = None
 
-        # DRY-RUN 必须在最前面拦住：上游模式真的会去建 Key、建卡密，不能试跑
+        # DRY-RUN 必须在最前面拦住：上游/二维码都会产生真实外部资源，不能试跑
         if settings.dry_run:
             if decision.needs_provision:
-                logger.warning("[%s][DRY-RUN] 本应查订单 %s 金额 → 建 Key → 出卡密 → 发给 %s",
+                logger.warning("[%s][DRY-RUN] 本应查订单 %s 金额 → 按规则换算天数 → 建 2018K 卡密 → 发给 %s",
                                self.name, msg.order_id, msg.sender_name)
+            elif decision.needs_invite:
+                logger.warning("[%s][DRY-RUN] 本应生成 MiniDaily 入池二维码（%s 天）→ 发给 %s",
+                               self.name, days if days is not None else rule.get("fixed_days"), msg.sender_name)
             else:
                 logger.warning("[%s][DRY-RUN] 本应发货：%s", self.name, _preview(content))
             return False
 
-        # ---- 上游模式：查订单金额 → 建 Key → 出卡密
+        # ---- 2018K 模式：查订单金额 → 换算天数 → 建卡密
         if decision.needs_provision:
             prepared = await self._provision(msg, rule)
             if prepared is None:
                 return False
-            card_code, amount_cny, quota_usd, content = prepared
+            provisioned, amount_cny, days, content = prepared
+            card_code = provisioned.card_code
+            software_id = provisioned.software_id
+        elif decision.needs_invite:
+            prepared_invite = await self._prepare_invite(msg, rule)
+            if prepared_invite is None:
+                return False
+            invite, amount_cny, days, content = prepared_invite
+            card_code = invite.token
 
+        # 自动确认必须在发送卡密之前完成。ORDER_STATUS_ERROR 说明订单当前
+        # 状态不允许确认发货，此时发卡密等于白送；只有确认成功（或订单已经
+        # 是已发货状态）才允许把卡密交给买家。
+        confirm_note = ""
+        if decision.auto_confirm and msg.order_id:
+            ok, detail = await self.client.confirm_shipping(msg.order_id)
+            already_delivered = "ORDER_ALREADY_DELIVERY" in detail.upper()
+            if ok:
+                confirm_note = "确认发货成功：" + detail
+            elif already_delivered:
+                confirm_note = "订单已发货：" + detail
+            else:
+                confirm_note = "确认发货失败：" + detail
+            logger.info("[%s] 订单 %s %s", self.name, msg.order_id, confirm_note)
+            if not ok and not already_delivered:
+                failure_detail = confirm_note
+                if provisioned is not None:
+                    removed, note = await self.provisioner.revoke(provisioned)
+                    failure_detail += "；" + note
+                    if removed:
+                        failure_detail += "；卡密已删除"
+                if invite is not None:
+                    failure_detail += "；MiniDaily 链接：" + invite.url
+                await self.db.record_order(
+                    account_id=self.account_id, order_id=msg.order_id, item_id=msg.item_id,
+                    buyer_id=msg.sender_id, buyer_name=msg.sender_name, rule_id=rule.get("id"),
+                    card_id=decision.card_id, content=content, status="confirm_failed",
+                    detail=failure_detail, amount_cny=amount_cny, duration_days=days,
+                    software_id=software_id, card_code=card_code,
+                )
+                logger.warning("[%s] 订单 %s 确认发货失败，未发送卡密：%s",
+                               self.name, msg.order_id, failure_detail)
+                return False
         try:
             await self.client.send_text_safe(msg.chat_id, msg.sender_id, content)
         except XianyuError as exc:
             logger.error("[%s] 发货消息发送失败：%s", self.name, exc)
+            detail = str(exc)
+            if provisioned is not None:
+                # 卡密已经建出来了、消息没发出去：能删就删，不能删就把卡密 ID 留在详情里
+                removed, note = await self.provisioner.revoke(provisioned)
+                detail += "；" + note
+                if removed:
+                    card_code = provisioned.card_code
+            if invite is not None:
+                detail += "；MiniDaily 链接：" + invite.url
             await self.db.record_order(
                 account_id=self.account_id, order_id=msg.order_id, item_id=msg.item_id,
                 buyer_id=msg.sender_id, buyer_name=msg.sender_name, rule_id=rule.get("id"),
-                card_id=None, content=content, status="send_failed", detail=str(exc),
-                amount_cny=amount_cny, quota_usd=quota_usd, card_code=card_code,
+                card_id=None, content=content, status="send_failed", detail=detail,
+                amount_cny=amount_cny, duration_days=days, software_id=software_id,
+                card_code=card_code,
             )
             return False
 
-        confirm_note = ""
-        if decision.auto_confirm and msg.order_id:
-            ok, detail = await self.client.confirm_shipping(msg.order_id)
-            confirm_note = ("确认发货成功：" if ok else "确认发货失败：") + detail
-            logger.info("[%s] 订单 %s %s", self.name, msg.order_id, confirm_note)
-
+        record_detail = confirm_note
+        if invite is not None:
+            record_detail = "MiniDaily 二维码：" + invite.url + "（" + str(days) + " 天，10 分钟内有效）"
+            if confirm_note:
+                record_detail += "；" + confirm_note
         await self.db.record_order(
             account_id=self.account_id, order_id=msg.order_id, item_id=msg.item_id,
             buyer_id=msg.sender_id, buyer_name=msg.sender_name, rule_id=rule.get("id"),
             card_id=decision.card_id, content=content, status="delivered",
-            detail=confirm_note, amount_cny=amount_cny, quota_usd=quota_usd,
-            card_code=card_code,
+            detail=record_detail, amount_cny=amount_cny, duration_days=days,
+            software_id=software_id, card_code=card_code,
         )
         self.engine.mark_delivered(self.account_id, msg.order_id)
         await self.db.log_message(
@@ -1225,47 +1381,205 @@ class AccountWorker:
             sender_name=msg.sender_name, item_id=msg.item_id, order_id=msg.order_id,
             content=content, kind="outgoing",
         )
-        logger.info("[%s] 已向 %s 发货（规则：%s，%s 元 → %s USD）",
-                    self.name, msg.sender_name, rule.get("name"), amount_cny, quota_usd)
+        if invite is not None:
+            logger.info("[%s] 已向 %s 发送 MiniDaily 入池二维码（规则：%s，%s 天）",
+                        self.name, msg.sender_name, rule.get("name"), days)
+        else:
+            logger.info("[%s] 已向 %s 发货（规则：%s，%s 元 → %s 天，卡密 %s）",
+                        self.name, msg.sender_name, rule.get("name"), amount_cny,
+                        days, card_code)
         return True
 
-    async def _provision(self, msg: IncomingMessage, rule: dict[str, Any]) -> tuple[str, float | None, float, str] | None:
-        """上游模式的实际动作，返回 (卡密, 金额, 额度, 发货文案)；失败返回 None。"""
+    async def _resolve_invite_terms(
+        self, msg: IncomingMessage, rule: dict[str, Any]
+    ) -> tuple[float | None, int] | None:
+        """算出二维码挂载天数；支持固定、按金额、按商品规格。"""
+        duration_mode = str(rule.get("duration_mode") or "fixed")
+        fixed_days = int(rule.get("fixed_days") or 0)
+        days_per_cny = float(rule.get("days_per_cny") or 1)
+        amount_cny: float | None = msg.amount_cny_hint
+
+        if amount_cny is None and duration_mode != "fixed":
+            order = await self._find_order_cached(msg.order_id) if msg.order_id else None
+            if order is None:
+                logger.warning("[%s] 二维码规则查不到订单 %s 金额，%s 秒后重试一次",
+                               self.name, msg.order_id, PROVISION_RETRY_DELAY)
+                await asyncio.sleep(PROVISION_RETRY_DELAY)
+                order = await self._find_order_cached(msg.order_id, fresh=True) if msg.order_id else None
+            await self._name_from_order(msg, order)
+            if order is None:
+                await self._record_failure(
+                    msg, rule, "二维码规则查不到订单金额", status="invite_failed"
+                )
+                return None
+            try:
+                amount_cny = pick_amount(order, settings.order_amount_unit).cny
+            except AmountError as exc:
+                await self._record_failure(
+                    msg, rule, "二维码规则金额解析失败：" + str(exc), status="invite_failed"
+                )
+                return None
+
+        if amount_cny is not None and settings.max_order_cny > 0 and amount_cny > settings.max_order_cny:
+            await self._record_failure(
+                msg, rule, "订单金额超上限", amount_cny=amount_cny, status="invite_failed"
+            )
+            return None
+
+        if duration_mode == "tiers":
+            tiers = parse_price_tiers(rule.get("price_tiers"))
+            if not tiers:
+                await self._record_failure(
+                    msg, rule, "二维码规则没有配置规格档位", amount_cny=amount_cny,
+                    status="invite_failed",
+                )
+                return None
+            tier = pick_price_tier(tiers, amount_cny or 0.0)
+            if tier is None:
+                await self._record_failure(
+                    msg, rule, "没有匹配的规格档位（订单 ¥" + str(amount_cny) + "）",
+                    amount_cny=amount_cny, status="invite_failed",
+                )
+                return None
+            days = int(tier["days"])
+        elif duration_mode == "fixed":
+            days = fixed_days
+            if days < 0:
+                await self._record_failure(
+                    msg, rule, "二维码挂载天数为负数", duration_days=days,
+                    status="invite_failed",
+                )
+                return None
+        else:
+            days = days_from_amount(amount_cny or 0.0, days_per_cny)
+            if days <= 0:
+                await self._record_failure(
+                    msg, rule, "二维码换算出 0 天", amount_cny=amount_cny,
+                    status="invite_failed",
+                )
+                return None
+        return amount_cny, days
+
+    async def _prepare_invite(
+        self, msg: IncomingMessage, rule: dict[str, Any]
+    ) -> tuple[MiniDailyInvite, float | None, int, str] | None:
+        """生成一次 MiniDailyReward 扫码入池邀请，并渲染买家要收到的文案。"""
+        terms = await self._resolve_invite_terms(msg, rule)
+        if terms is None:
+            return None
+        amount_cny, days = terms
+        label = build_card_label(msg.sender_name or "买家", msg.order_id)
+        try:
+            invite = await MiniDailyClient().create_invite(days, note=label)
+        except MiniDailyError as exc:
+            logger.error("[%s] MiniDaily 二维码生成失败：%s", self.name, exc)
+            await self._record_failure(
+                msg, rule, "MiniDaily 二维码生成失败：" + str(exc),
+                duration_days=days, status="invite_failed",
+            )
+            return None
+
+        content = render(
+            rule["content"],
+            buyer_name=msg.sender_name,
+            item_id=msg.item_id,
+            order_id=msg.order_id,
+            card=invite.url,
+            qr_url=invite.url,
+            days=days,
+        )
+        if not content.strip():
+            content = (
+                "你好 {buyer}，这是你的 MiniDailyReward 入池二维码/链接：\n\n"
+                "{qr_url}\n\n挂载天数：{days} 天\n"
+                "链接 10 分钟内有效，请尽快打开并按页面提示填写迷你号/密码。"
+            )
+            content = render(
+                content, buyer_name=msg.sender_name, order_id=msg.order_id,
+                qr_url=invite.url, days=days,
+            )
+        return invite, amount_cny, days, content
+
+    async def _provision_card_with_retry(
+        self, software_id: str, days: int, label: str, *, username: str
+    ) -> Provisioned:
+        """建卡失败后最多重试一次，间隔 10 秒。
+
+        配置错误/实例不存在这类确定性错误不重试，避免无意义的重复请求。
+        """
+        assert self.provisioner is not None
+        try:
+            return await self.provisioner.provision(
+                software_id, days, label, username=username
+            )
+        except UpstreamError as exc:
+            text = str(exc)
+            if any(marker in text for marker in (
+                "未配置", "不在 XY_2018K_INSTANCES", "天数不能", "实例不存在",
+            )):
+                raise
+            logger.warning("[%s] 2018K 建卡失败，%s 秒后重试一次：%s",
+                           self.name, PROVISION_RETRY_DELAY, exc)
+            await asyncio.sleep(PROVISION_RETRY_DELAY)
+            return await self.provisioner.provision(
+                software_id, days, label, username=username
+            )
+
+    async def _provision(
+        self, msg: IncomingMessage, rule: dict[str, Any]
+    ) -> tuple[Provisioned, float | None, int, str] | None:
+        """2018K 模式的实际动作，返回 (卡密, 金额, 天数, 发货文案)；失败返回 None。"""
         if self.provisioner is None:
-            logger.error("[%s] 规则是上游模式，但没有配置 new-api / 卡密站", self.name)
-            await self._record_failure(msg, rule, "上游未配置")
+            logger.error("[%s] 规则是 2018K 模式，但没有配置 XY_2018K_OPENID / 实例", self.name)
+            await self._record_failure(msg, rule, "2018K 未配置")
             return None
         if not msg.order_id:
-            logger.error("[%s] 上游模式需要订单号，但这条消息里没有", self.name)
+            logger.error("[%s] 2018K 模式需要订单号，但这条消息里没有", self.name)
             await self._record_failure(msg, rule, "缺少订单号")
             return None
 
         assert self.client is not None
-        rule_fixed = float(rule.get("fixed_usd") or 0)
+        software_id = str(rule.get("software_id") or "").strip()
+        if not software_id:
+            logger.error("[%s] 规则「%s」没有选择 2018K 实例", self.name, rule.get("name"))
+            await self._record_failure(msg, rule, "规则未选择 2018K 实例")
+            return None
+
+        duration_mode = str(rule.get("duration_mode") or "fixed")
+        fixed_days = int(rule.get("fixed_days") or 0)
+        days_per_cny = float(rule.get("days_per_cny") or 1)
 
         # 订单轮询那条路已经带了实付金额，直接用，省掉一次订单详情往返
         amount_cny: float | None = msg.amount_cny_hint
 
+        # 即使固定天数，也尽量把订单金额和买家真名查到：金额进发货记录，名字进卡密备注
         if amount_cny is None:
             order = await self._find_order_cached(msg.order_id)
-            # 这一步不能晚于建令牌：new-api 的令牌名就是「买家用户名#订单号」，
-            # 名字定下来之后再改，后台里留下的还是那条「买家#…」。
+            if order is None and duration_mode != "fixed":
+                logger.warning("[%s] 查不到订单 %s 金额，%s 秒后重试一次",
+                               self.name, msg.order_id, PROVISION_RETRY_DELAY)
+                await asyncio.sleep(PROVISION_RETRY_DELAY)
+                order = await self._find_order_cached(msg.order_id, fresh=True)
             await self._name_from_order(msg, order)
             if order is None:
-                if rule_fixed > 0:
-                    logger.warning("[%s] 查不到订单 %s 金额，改用规则里的固定额度 %s USD",
-                                   self.name, msg.order_id, rule_fixed)
+                if duration_mode == "fixed":
+                    logger.warning(
+                        "[%s] 查不到订单 %s 金额，改用规则固定天数 %s 天",
+                        self.name, msg.order_id, fixed_days,
+                    )
                 else:
-                    logger.error("[%s] 查不到订单 %s 的金额", self.name, msg.order_id)
+                    logger.error("[%s] 重试后仍查不到订单 %s 的金额", self.name, msg.order_id)
                     await self._record_failure(msg, rule, "查不到订单金额")
                     return None
             else:
                 try:
                     amount_cny = pick_amount(order, settings.order_amount_unit).cny
                 except AmountError as exc:
-                    if rule_fixed > 0:
-                        logger.warning("[%s] 订单 %s 金额解析失败（%s），改用固定额度 %s USD",
-                                       self.name, msg.order_id, exc, rule_fixed)
+                    if duration_mode == "fixed":
+                        logger.warning(
+                            "[%s] 订单 %s 金额解析失败（%s），改用规则固定天数 %s 天",
+                            self.name, msg.order_id, exc, fixed_days,
+                        )
                     else:
                         logger.error("[%s] 订单 %s 金额解析失败：%s", self.name, msg.order_id, exc)
                         await self._record_failure(msg, rule, "金额解析失败")
@@ -1277,27 +1591,49 @@ class AccountWorker:
             await self._record_failure(msg, rule, "订单金额超上限", amount_cny=amount_cny)
             return None
 
-        quota = quota_from_amount(
-            amount_cny or 0.0,
-            multiplier=float(rule.get("usd_multiplier") or 1),
-            fixed_usd=rule_fixed,
-            cny_per_usd=settings.cny_per_usd,
-        )
-        if quota <= 0:
-            logger.error("[%s] 订单 %s 换算额度为 0，跳过", self.name, msg.order_id)
-            await self._record_failure(msg, rule, "换算额度为 0", amount_cny=amount_cny)
-            return None
-        # 卡密名称 = 令牌名 = 买家用户名#订单号；价格只进额度和日志
+        if duration_mode == "tiers":
+            tiers = parse_price_tiers(rule.get("price_tiers"))
+            if not tiers:
+                logger.error("[%s] 规则「%s」按规格发货，但没有配置任何规格档位",
+                             self.name, rule.get("name"))
+                await self._record_failure(msg, rule, "规则没有配置规格档位", amount_cny=amount_cny)
+                return None
+            tier = pick_price_tier(tiers, amount_cny or 0.0)
+            if tier is None:
+                logger.error("[%s] 订单 %s 金额 %s 元没有匹配的规格档位",
+                             self.name, msg.order_id, amount_cny)
+                await self._record_failure(
+                    msg, rule, "没有匹配的规格档位（订单 ¥" + str(amount_cny) + "）",
+                    amount_cny=amount_cny, software_id=software_id,
+                )
+                return None
+            days = int(tier["days"])
+            logger.info("[%s] 按规格「%s」¥%s → %s 天", self.name,
+                        tier.get("label"), tier.get("price"), days)
+        elif duration_mode == "fixed":
+            days = fixed_days
+            if days < 0:
+                logger.error("[%s] 规则「%s」固定天数为负数", self.name, rule.get("name"))
+                await self._record_failure(msg, rule, "固定天数为负数", amount_cny=amount_cny)
+                return None
+        else:
+            days = days_from_amount(amount_cny or 0.0, days_per_cny)
+            if days <= 0:
+                logger.error("[%s] 订单 %s 换算天数为 0（金额 %s，每元 %s 天）",
+                             self.name, msg.order_id, amount_cny, days_per_cny)
+                await self._record_failure(msg, rule, "换算天数为 0", amount_cny=amount_cny)
+                return None
+
         label = build_card_label(msg.sender_name or "买家", msg.order_id)
         try:
-            provisioned = await self.provisioner.provision(
-                quota, label, username=msg.sender_name or "买家"
+            provisioned = await self._provision_card_with_retry(
+                software_id, days, label, username=msg.sender_name or "买家"
             )
         except UpstreamError as exc:
-            logger.error("[%s] 上游建卡密失败：%s", self.name, exc)
+            logger.error("[%s] 2018K 建卡密失败：%s", self.name, exc)
             await self._record_failure(
-                msg, rule, "上游建卡密失败：" + str(exc),
-                amount_cny=amount_cny, quota_usd=quota,
+                msg, rule, "2018K 建卡密失败：" + str(exc),
+                amount_cny=amount_cny, duration_days=days, software_id=software_id,
             )
             return None
 
@@ -1308,9 +1644,9 @@ class AccountWorker:
             order_id=msg.order_id,
             card=provisioned.card_code,
             amount_cny=amount_cny,
-            quota_usd=quota,
+            days=days,
         )
-        return provisioned.card_code, amount_cny, quota, content
+        return provisioned, amount_cny, days, content
 
     async def _record_blocked(self, msg: IncomingMessage, reason: str) -> None:
         """记一条「有人拿『我已付款』想触发发货，但没过鉴权」。
@@ -1335,7 +1671,9 @@ class AccountWorker:
         reason: str,
         *,
         amount_cny: float | None = None,
-        quota_usd: float | None = None,
+        duration_days: int | None = None,
+        software_id: str | None = None,
+        status: str = "upstream_failed",
     ) -> None:
         """记一条失败。
 
@@ -1346,8 +1684,8 @@ class AccountWorker:
         await self.db.record_order(
             account_id=self.account_id, order_id=msg.order_id, item_id=msg.item_id,
             buyer_id=msg.sender_id, buyer_name=msg.sender_name, rule_id=rule.get("id"),
-            card_id=None, content="", status="upstream_failed", detail=reason,
-            amount_cny=amount_cny, quota_usd=quota_usd,
+            card_id=None, content="", status=status, detail=reason,
+            amount_cny=amount_cny, duration_days=duration_days, software_id=software_id,
         )
 
 class WorkerManager:
@@ -1357,8 +1695,8 @@ class WorkerManager:
         self.db = db
         self.engine = DeliveryEngine(db, cooldown=settings.delivery_cooldown)
         self.reply_engine = AutoReplyEngine(db)
-        #: 上游联动（new-api + 卡密站）。没配置就是 None，规则选了上游模式会明确报错。
-        self.provisioner = provisioner if provisioner is not None else (Provisioner() if upstream_ready() else None)
+        #: 上游联动（2018K）。没配置就是 None，规则选了 2018K 模式会明确报错。
+        self.provisioner = provisioner if provisioner is not None else (Provisioner() if k2018_ready() else None)
         self.workers: dict[int, AccountWorker] = {}
         #: 后台一次性任务（上游预热等），留引用防止被 GC
         self._bg_tasks: set[asyncio.Task[Any]] = set()
@@ -1389,14 +1727,67 @@ class WorkerManager:
                     await worker.stop()
                     worker.start()
 
-        # 上游连接（DNS/TLS/登录）提前建好，免得第一单多等一次握手
-        if self.provisioner is not None and wanted:
+        # 上游连接（DNS/TLS/登录）提前建好，免得第一单多等一次握手；
+        # 即使还没登录闲鱼账号，也要探测 2018K，面板才能显示真实连接状态。
+        if self.provisioner is not None:
             warmup = getattr(self.provisioner, "warmup", None)
             if warmup is not None:
                 task = asyncio.create_task(warmup(), name="upstream-warmup")
                 # 留个引用，否则任务对象可能被 GC，异常也没人收
                 self._bg_tasks.add(task)
                 task.add_done_callback(self._bg_tasks.discard)
+
+    def k2018_health(self) -> dict[str, Any]:
+        """给后台用的 2018K 最近连接状态；没配置时明确返回未配置。"""
+        if self.provisioner is None:
+            return {
+                "ok": False,
+                "error": "2018K 未配置",
+                "checked_at": 0.0,
+                "instances": [],
+                "admin_ok": None,
+                "admin_error": "",
+            }
+        health = getattr(self.provisioner, "health", None)
+        if health is None:
+            return {"ok": None, "error": "", "checked_at": 0.0, "instances": []}
+        return health()
+
+    async def check_k2018_health(self) -> dict[str, Any]:
+        """手动触发一次 2018K 连接检测。
+
+        不做定时轮询：每次探测都是一次上游请求，只在启动、保存配置或
+        用户点「重新检测」时发，避免长期高频请求触发上游防护。
+        """
+        provisioner = self.provisioner
+        warmup = getattr(provisioner, "warmup", None) if provisioner is not None else None
+        if warmup is not None:
+            try:
+                await warmup(quiet=True, check_admin=False)
+            except Exception as exc:  # pragma: no cover - 手动检测失败也要返回最近状态
+                logger.warning("2018K 手动检测异常：%s", exc)
+        return self.k2018_health()
+
+    async def reload_k2018(self) -> None:
+        """面板保存配置后热切换上游，不用重启整个服务。
+
+        先建新连接并做一次 warmup，成功后再把 running worker 指过去；
+        旧连接关闭失败只记日志，不能让新配置回滚。
+        """
+        old = self.provisioner
+        new = Provisioner() if k2018_ready() else None
+        self.provisioner = new
+        for worker in self.workers.values():
+            worker.provisioner = new
+        if new is not None:
+            await new.warmup()
+        if old is not None and old is not new:
+            close = getattr(old, "close", None)
+            if close is not None:
+                try:
+                    await close()
+                except Exception as exc:  # pragma: no cover - 关闭旧连接不影响新配置
+                    logger.warning("关闭旧 2018K 连接失败：%s", exc)
 
     async def stop_all(self) -> None:
         await asyncio.gather(*(w.stop() for w in self.workers.values()), return_exceptions=True)

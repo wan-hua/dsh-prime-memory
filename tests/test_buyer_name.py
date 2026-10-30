@@ -1,7 +1,7 @@
 """买家昵称解析：卡片标题不能当昵称用。
 
 线上真实事故：新买家付款时，交易卡片的 reminderTitle 是「等待你发货」，
-被当成买家名一路传到 new-api，令牌名变成「等待你发货#5127561614038013111」，
+被当成买家名一路传到 2018K，卡密备注变成「等待你发货#5127561614038013111」，
 后台根本认不出这是谁。同一个 reminderTitle 字段在真人消息里却是真昵称，
 所以必须按内容过滤 + 回查聊天记录。
 """
@@ -16,7 +16,7 @@ import msgpack
 from app.codec import is_placeholder_name, parse_message, pick_display_name
 from app.engine import DeliveryEngine
 from app.runner import AccountWorker
-from app.upstream import build_token_name
+from app.upstream import build_card_label
 
 MY = "4167468834"
 BUYER = "4036871291"
@@ -53,7 +53,7 @@ def test_pick_display_name_falls_back():
 
 def test_token_name_uses_real_nickname_not_card_title():
     resolved = pick_display_name("等待你发货", REAL_NICK)
-    assert build_token_name(resolved, ORDER) == REAL_NICK + "#" + ORDER
+    assert build_card_label(resolved, ORDER) == REAL_NICK + "#" + ORDER
 
 
 # ---------------------------------------------------------------- 解析链路
@@ -132,7 +132,7 @@ class FakeClient:
         return True, "SUCCESS"
 
     async def find_order(self, order_id):
-        # 规则用固定额度，不需要真去查金额；返回 None 走 fixed_usd 分支
+        # 规则用固定天数，不需要真去查金额；返回 None 走 fixed_days 分支
         return None
 
     async def close(self):
@@ -143,11 +143,11 @@ class FakeProvisioner:
     def __init__(self):
         self.usernames = []
 
-    async def provision(self, quota_usd, label, username=""):
+    async def provision(self, software_id, days, label, username=""):
         from app.upstream import Provisioned
 
         self.usernames.append(username)
-        return Provisioned("CARD-1", "sk-a…z", quota_usd, "1")
+        return Provisioned("CARD-1", "CARD…1", days, software_id)
 
 
 async def build_worker(db):
@@ -178,7 +178,7 @@ async def test_provision_uses_real_nickname_from_history(db):
     await db.save_rule({
         "name": "按金额", "item_id": "*", "enabled": True, "mode": "upstream",
         "content": "卡密：{card}", "auto_confirm": False, "priority": 0, "remark": "",
-        "usd_multiplier": 1.0, "fixed_usd": 1.0,
+        "software_id": "B4ADC92FDF7240398D8A80A4176C80BD", "duration_mode": "fixed", "fixed_days": 1, "days_per_cny": 1.0,
     })
     worker, provisioner = await build_worker(db)
     await worker._on_frame(frame_with(paid_card_payload()))
@@ -193,10 +193,10 @@ async def test_unknown_buyer_still_gets_a_sane_token_name(db):
     await db.save_rule({
         "name": "按金额", "item_id": "*", "enabled": True, "mode": "upstream",
         "content": "卡密：{card}", "auto_confirm": False, "priority": 0, "remark": "",
-        "usd_multiplier": 1.0, "fixed_usd": 1.0,
+        "software_id": "B4ADC92FDF7240398D8A80A4176C80BD", "duration_mode": "fixed", "fixed_days": 1, "days_per_cny": 1.0,
     })
     worker, provisioner = await build_worker(db)
     await worker._on_frame(frame_with(paid_card_payload()))
 
     assert provisioner.usernames == ["买家"]
-    assert "等待你发货" not in build_token_name(provisioner.usernames[0], ORDER)
+    assert "等待你发货" not in build_card_label(provisioner.usernames[0], ORDER)

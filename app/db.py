@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -36,6 +37,13 @@ CREATE TABLE IF NOT EXISTS rules (
     auto_confirm INTEGER NOT NULL DEFAULT 0,
     usd_multiplier REAL NOT NULL DEFAULT 1,
     fixed_usd REAL NOT NULL DEFAULT 0,
+    -- 2018K 上游：规则绑定实例 + 卡密时长（天）
+    software_id TEXT NOT NULL DEFAULT '',
+    duration_mode TEXT NOT NULL DEFAULT 'fixed',
+    fixed_days INTEGER NOT NULL DEFAULT 0,
+    days_per_cny REAL NOT NULL DEFAULT 1,
+    -- 多规格商品：JSON [{sku_id,label,price,days}]
+    price_tiers TEXT NOT NULL DEFAULT '[]',
     priority INTEGER NOT NULL DEFAULT 0,
     remark TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
@@ -127,9 +135,20 @@ CREATE TABLE IF NOT EXISTS messages (
     order_id TEXT,
     content TEXT,
     kind TEXT NOT NULL DEFAULT 'incoming',
+    msg_type TEXT NOT NULL DEFAULT 'chat',
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS order_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    order_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    last_at TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    UNIQUE (account_id, order_id, action)
+);
 """
 
 
@@ -137,10 +156,18 @@ CREATE INDEX IF NOT EXISTS idx_messages_created ON messages (created_at DESC);
 MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("rules", "usd_multiplier", "REAL NOT NULL DEFAULT 1"),
     ("rules", "fixed_usd", "REAL NOT NULL DEFAULT 0"),
+    ("rules", "software_id", "TEXT NOT NULL DEFAULT ''"),
+    ("rules", "duration_mode", "TEXT NOT NULL DEFAULT 'fixed'"),
+    ("rules", "fixed_days", "INTEGER NOT NULL DEFAULT 0"),
+    ("rules", "days_per_cny", "REAL NOT NULL DEFAULT 1"),
+    ("rules", "price_tiers", "TEXT NOT NULL DEFAULT '[]'"),
     ("orders", "amount_cny", "REAL"),
     ("orders", "quota_usd", "REAL"),
     ("orders", "api_key_id", "TEXT"),
     ("orders", "card_code", "TEXT"),
+    ("orders", "duration_days", "INTEGER"),
+    ("orders", "software_id", "TEXT"),
+    ("messages", "msg_type", "TEXT NOT NULL DEFAULT 'chat'"),
 )
 
 
@@ -158,6 +185,25 @@ async def _apply_migrations(conn: aiosqlite.Connection) -> None:
         if column in existing:
             continue
         await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    await conn.commit()
+
+
+async def _backfill_message_types(conn: aiosqlite.Connection) -> None:
+    """给旧消息补「聊天 / 交易通知」分类；只按可识别的内容特征改，不碰订单。"""
+    await conn.execute(
+        """
+        UPDATE messages SET msg_type = 'trade'
+        WHERE msg_type = 'chat' AND (
+            substr(ltrim(content), 1, 1) = '['
+            OR content LIKE '%快给ta一个评价%'
+            OR content LIKE '%卖家人不错%'
+            OR content LIKE '%买家确认收货%'
+            OR content LIKE '%交易成功%'
+            OR content LIKE '%去评价%'
+            OR content LIKE '%我完成了评价%'
+        )
+        """
+    )
     await conn.commit()
 
 
@@ -194,6 +240,7 @@ class Database:
             await conn.executescript(SCHEMA)
             await conn.commit()
             await _apply_migrations(conn)
+            await _backfill_message_types(conn)
         finally:
             await conn.close()
 
@@ -306,20 +353,24 @@ class Database:
         values = (
             payload["name"], payload["item_id"], int(payload["enabled"]), payload["mode"],
             payload["content"], int(payload["auto_confirm"]), int(payload["priority"]),
-            payload["remark"], float(payload.get("usd_multiplier", 1) or 1),
-            float(payload.get("fixed_usd", 0) or 0),
+            payload["remark"], payload.get("software_id") or "",
+            payload.get("duration_mode") or "fixed",
+            int(payload.get("fixed_days") or 0),
+            float(payload.get("days_per_cny") or 1),
+            json.dumps(payload.get("price_tiers") or [], ensure_ascii=False),
         )
         if rule_id:
             await self.execute(
                 "UPDATE rules SET name = ?, item_id = ?, enabled = ?, mode = ?, content = ?,"
-                " auto_confirm = ?, priority = ?, remark = ?, usd_multiplier = ?, fixed_usd = ?,"
-                " updated_at = ? WHERE id = ?",
+                " auto_confirm = ?, priority = ?, remark = ?, software_id = ?, duration_mode = ?,"
+                " fixed_days = ?, days_per_cny = ?, price_tiers = ?, updated_at = ? WHERE id = ?",
                 (*values, ts, rule_id),
             )
             return rule_id
         return await self.execute(
             "INSERT INTO rules (name, item_id, enabled, mode, content, auto_confirm, priority, remark,"
-            " usd_multiplier, fixed_usd, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " software_id, duration_mode, fixed_days, days_per_cny, price_tiers, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (*values, ts, ts),
         )
     async def delete_rule(self, rule_id: int) -> None:
@@ -500,12 +551,12 @@ class Database:
     #: 但拼 SQL 的地方显式收口一下，免得哪天有人把外部字符串递进来。
     _ORDER_COLUMNS = frozenset({
         "account_id", "order_id", "item_id", "buyer_id", "buyer_name", "rule_id",
-        "card_id", "content", "amount_cny", "quota_usd", "api_key_id", "card_code",
-        "status", "detail", "created_at",
+        "card_id", "content", "amount_cny", "quota_usd", "duration_days", "software_id",
+        "api_key_id", "card_code", "status", "detail", "created_at",
     })
     _MESSAGE_COLUMNS = frozenset({
         "account_id", "chat_id", "sender_id", "sender_name", "item_id", "order_id",
-        "content", "kind", "created_at",
+        "content", "kind", "msg_type", "created_at",
     })
 
     @classmethod
@@ -554,6 +605,7 @@ class Database:
 
     async def log_message(self, **fields: Any) -> int:
         fields.setdefault("created_at", now_iso())
+        fields.setdefault("msg_type", "chat")
         names = self._checked_columns(fields, self._MESSAGE_COLUMNS)
         columns = ", ".join(names)
         placeholders = ", ".join("?" for _ in names)
@@ -624,6 +676,65 @@ class Database:
         finally:
             await conn.close()
         return changed
+
+    async def backfill_buyer_name_by_order(
+        self, account_id: int, order_id: str, name: str, buyer_id: str = ""
+    ) -> int:
+        """按订单号纠正同一笔交易下所有「买家」占位记录。
+
+        交易卡片有时把 sender_id 写成通知服务号，而不是真实买家；
+        只按 sender_id 回填会漏掉同一订单的其他卡片。订单号是这笔交易
+        共有的锚点，用它把名字和真实买家 ID 一起补齐。
+        """
+        from .codec import is_placeholder_name
+
+        order_id = str(order_id or "").strip()
+        name = str(name or "").strip()
+        buyer_id = str(buyer_id or "").strip()
+        if not account_id or not order_id or not name or is_placeholder_name(name):
+            return 0
+
+        changed = 0
+        conn = await self.connect()
+        try:
+            rows = await conn.execute(
+                "SELECT id, sender_id, sender_name, msg_type FROM messages"
+                " WHERE account_id = ? AND order_id = ?",
+                (account_id, order_id),
+            )
+            updates: list[tuple[str, str, int]] = []
+            for row in await rows.fetchall():
+                stale = is_placeholder_name(row["sender_name"])
+                trade = str(row["msg_type"] or "") == "trade"
+                new_sender = buyer_id if buyer_id and trade else str(row["sender_id"] or "")
+                new_name = name if stale else str(row["sender_name"] or "")
+                if new_name != str(row["sender_name"] or "") or new_sender != str(row["sender_id"] or ""):
+                    updates.append((new_name, new_sender, int(row["id"])))
+            if updates:
+                await conn.executemany(
+                    "UPDATE messages SET sender_name = ?, sender_id = ? WHERE id = ?",
+                    updates,
+                )
+                changed += len(updates)
+
+            order_rows = await conn.execute(
+                "SELECT id, buyer_name FROM orders WHERE account_id = ? AND order_id = ?",
+                (account_id, order_id),
+            )
+            order_updates: list[tuple[str, int]] = []
+            for row in await order_rows.fetchall():
+                if is_placeholder_name(row["buyer_name"]):
+                    order_updates.append((name, int(row["id"])))
+            if order_updates:
+                await conn.executemany(
+                    "UPDATE orders SET buyer_name = ? WHERE id = ?", order_updates
+                )
+                changed += len(order_updates)
+            await conn.commit()
+        finally:
+            await conn.close()
+        return changed
+
     async def repair_placeholder_buyer_names(self, account_id: int) -> int:
         """把库里「名字不是名字」的记录，按同一买家的聊天记录纠正一遍。
 
@@ -659,7 +770,7 @@ class Database:
         """这个买家**可信**的昵称（以前在真人聊天里出现过的那个）。
 
         为什么需要它：交易卡片里的 reminderTitle 是卡片标题（「等待你发货」），
-        不是昵称。只靠当条消息取名，就会在 new-api 里留下
+        不是昵称。只靠当条消息取名，就会在 2018K 后台留下
         「等待你发货#5127561614038013111」这种谁也认不出来的令牌名。
         聊天记录里他真实说过的消息带的是真昵称，翻一条出来用。
         """
@@ -714,3 +825,36 @@ class Database:
 
     async def list_messages(self, limit: int = 100) -> list[dict[str, Any]]:
         return await self.fetch_all("SELECT * FROM messages ORDER BY id DESC LIMIT ?", (limit,))
+
+    async def get_order_action(
+        self, account_id: int, order_id: str, action: str
+    ) -> dict[str, Any] | None:
+        """取某个订单某类自动动作的最后执行记录。"""
+        return await self.fetch_one(
+            "SELECT * FROM order_actions WHERE account_id = ? AND order_id = ? AND action = ?",
+            (account_id, str(order_id), action),
+        )
+
+    async def set_order_action(
+        self, account_id: int, order_id: str, action: str, *, detail: str = ""
+    ) -> None:
+        """记录某订单动作已执行；重复执行时更新时间。"""
+        await self.execute(
+            """
+            INSERT INTO order_actions (account_id, order_id, action, last_at, detail)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (account_id, order_id, action)
+            DO UPDATE SET last_at = excluded.last_at, detail = excluded.detail
+            """,
+            (account_id, str(order_id), action, now_iso(), detail),
+        )
+
+    async def clear_messages(self) -> int:
+        """清空消息流水，返回删除条数；订单、规则、卡密都不受影响。"""
+        conn = await self.connect()
+        try:
+            cur = await conn.execute("DELETE FROM messages")
+            await conn.commit()
+            return int(cur.rowcount or 0)
+        finally:
+            await conn.close()

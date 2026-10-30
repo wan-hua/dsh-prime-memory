@@ -5,6 +5,8 @@ httpx>=0.27
 # 13 起 WebSocketClientProtocol 是废弃别名，15 起正式提供 ClientConnection
 websockets>=15.0
 msgpack>=1.0
+# 2018K 创建卡密需要对 info 做 AES-CBC 加密
+cryptography>=42.0
 # 扫码登录二维码
 qrcode>=7.4
 pillow>=10.0

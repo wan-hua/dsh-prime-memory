@@ -164,12 +164,12 @@ class FakeProvisioner:
         self.usernames = []
         self.labels = []
 
-    async def provision(self, quota_usd, label, username=""):
+    async def provision(self, software_id, days, label, username=""):
         from app.upstream import Provisioned
 
         self.usernames.append(username)
         self.labels.append(label)
-        return Provisioned("CARD-1", "sk-a…z", quota_usd, "1")
+        return Provisioned("CARD-1", "sk-a…z", days, software_id)
 
 
 async def build_worker(db, order):
@@ -185,7 +185,7 @@ async def save_rule(db):
     await db.save_rule({
         "name": "按金额", "item_id": "*", "enabled": True, "mode": "upstream",
         "content": "你好 {buyer}，卡密：{card}", "auto_confirm": False, "priority": 0,
-        "remark": "", "usd_multiplier": 1.0, "fixed_usd": 0.0,
+        "remark": "", "software_id": "B4ADC92FDF7240398D8A80A4176C80BD", "duration_mode": "per_amount", "fixed_days": 0, "days_per_cny": 1.0,
     })
 
 
@@ -303,7 +303,7 @@ async def test_fixed_text_rule_resolves_name_before_rendering(db):
     await db.save_rule({
         "name": "固定文案", "item_id": "*", "enabled": True, "mode": "card",
         "content": "你好 {buyer}，这是你的卡密：{card}", "auto_confirm": False,
-        "priority": 0, "remark": "", "usd_multiplier": 1.0, "fixed_usd": 0.0,
+        "priority": 0, "remark": "", "software_id": "B4ADC92FDF7240398D8A80A4176C80BD", "duration_mode": "per_amount", "fixed_days": 0, "days_per_cny": 1.0,
     })
     await db.add_cards(["AAAA-BBBB"], item_id=ITEM)
     worker, _ = await build_worker(db, order_item())

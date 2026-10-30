@@ -51,7 +51,7 @@ IGNORED_KEYWORDS: tuple[str, ...] = (
 #: 这些串出现在 reminderTitle 里时，它是**卡片标题**，不是买家昵称。
 #: 线上真实取值：「等待你发货」「买家已拍下，待付款」「我发起了退款申请」
 #: 「等待买家收货」「交易关闭」……同一个买家 id 会因为这些卡片拿到好几个
-#: 不同的「名字」，于是 new-api 里出现「等待你发货#5127561614038013111」这种
+#: 不同的「名字」，于是 2018K 后台出现「等待你发货#5127561614038013111」这种
 #: 根本对不上人的令牌名。
 PLACEHOLDER_NAME_PARTS: tuple[str, ...] = (
     "等待你发货",
@@ -139,6 +139,33 @@ def buyer_nick_from_session(*nodes: Any) -> str:
     return ""
 
 
+#: 这些内容属于交易/系统通知，不是买家在聊天框里打的字。
+#: 用于把消息流水和聚合里的「聊天」与「交易通知」分开。
+_TRADE_CONTENT_PARTS: tuple[str, ...] = (
+    "快给ta一个评价",
+    "卖家人不错",
+    "买家确认收货",
+    "交易成功",
+    "去评价",
+    "我完成了评价",
+    "我已付款",
+    "我已拍下",
+    "你已发货",
+    "退款成功",
+    "发起了退款",
+)
+
+
+def is_trade_content(content: str | None) -> bool:
+    """判断一条消息是否属于交易/系统通知，而不是买家真人聊天。"""
+    text = str(content or "").strip()
+    if not text:
+        return False
+    if text.startswith("["):
+        return True
+    return any(part in text for part in _TRADE_CONTENT_PARTS)
+
+
 def buyer_nick_from_order(order: dict[str, Any] | None) -> str:
     """从订单详情里取买家昵称；取不到返回空串。
 
@@ -160,6 +187,23 @@ def buyer_nick_from_order(order: dict[str, Any] | None) -> str:
         name = pick_display_name(buyer.get(key), fallback="")
         if name:
             return name
+    return ""
+
+
+def buyer_id_from_order(order: dict[str, Any] | None) -> str:
+    """从订单详情里取买家 ID；取不到返回空串，只认 buyerInfoVO 这棵树。"""
+    if not isinstance(order, dict) or not order:
+        return ""
+    buyer = _as_dict(order.get("buyerInfoVO"))
+    if not buyer:
+        for key, value in walk_pairs(order):
+            if key == "buyerInfoVO" and isinstance(value, dict):
+                buyer = value
+                break
+    for key in ("buyerId", "userId"):
+        value = str(buyer.get(key) or "").strip()
+        if value:
+            return value
     return ""
 
 
@@ -868,7 +912,7 @@ def _decode_message_object(obj: dict[str, Any], my_id: str) -> IncomingMessage |
         chat_id=chat_id,
         sender_id=sender_id or "",
         # reminderTitle 在卡片消息里是标题（「等待你发货」），不是昵称 ——
-        # 会一路传到 new-api 的令牌名上，必须过滤。
+        # 会一路传到 2018K 的卡密备注上，必须过滤。
         sender_name=pick_display_name(extension.get("reminderTitle")),
         content=content_text,
         item_id=item_id,

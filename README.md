@@ -3,8 +3,10 @@
 买家拍下并付款后，自动把卡密 / 发货文案发到私信里，并按需点掉「无需物流发货」。
 纯 Python + SQLite，自带 Web 管理后台，不需要 MySQL / Redis。
 
-也可以接上 **new-api + new-api-cost** 全自动开卡：按订单实付金额建对应额度的 Key，
-再把 Key 换成卡密发给买家 —— 原来手工做的三步全部省掉。
+> 端到端工作流图：[docs/WORKFLOW.md](docs/WORKFLOW.md) · [PNG 预览](docs/workflow.png)
+
+也可以接上 **2018K 卡密验证平台**：按订单实付金额换算出卡密天数，
+自动在指定实例上建卡密并发给买家 —— 原来手工建卡、复制卡密的两步全部省掉。
 
 ## 功能
 
@@ -13,12 +15,13 @@
 - **订单轮询兜底**：IM 推送会因为断线/风控漏消息，所以另外定时拉一次「待发货」订单；两条路都靠 `delivered` 去重，不会重复发。
 - **快发货**：收到任何 IM 推送就提前叫醒轮询（`XY_ORDER_HINT_POLL_GAP`），订单里已经带了金额就不再查一次详情，买家的会话能复用就不重新建；
   同时待发货订单并行处理（`XY_ORDER_POLL_CONCURRENCY`）。实测「付款 → 收到卡密」通常只要 1~2 秒。
-- **按金额自动开卡**（可选）：查订单实付金额 → new-api 建同额度令牌 → 卡密站生成卡密 → 发给买家，失败会回滚令牌。
-  令牌名按 `买家用户名#订单号` 生成（如 `靓小小虫#3317155032043104797`），方便在 new-api 后台按买家对账。
+- **按金额自动建 2018K 卡密**（可选）：查订单实付金额 → 按规则换算天数 → 在规则绑定的实例上建卡密 → 发给买家。
+- **MiniDailyReward 扫码入池**（可选）：按规则固定挂载天数生成一次性邀请链接 → 发给买家；买家打开链接填写迷你号/密码即可入池。
+  卡密备注按 `买家用户名#订单号` 生成（如 `靓小小虫#3317155032043104797`），方便在 2018K 后台按买家对账。
   买家名取不到时会依次退：会话资料 → 聊天记录 → 订单详情 → 「买家」，拿到真名后连历史流水一起回填。
-- **Key 限模型**：新建的令牌默认只允许 deepseek-v4.1-flash（model_limits_enabled 与 model_limits 一起下发），
-  买家拿 Key 也调不了别的模型。**模型白名单直接在后台「设置」页改，保存即生效，不用重启、不用改 .env**；
-  `.env` 里的 `XY_NEWAPI_MODEL_LIMITS` 只在后台没保存过时作为默认值。
+- **规则可选实例 + 时长**：同一套程序可以卖多个 2018K 实例（如 `Miracles` / `MiraclesX64`）；
+  每条发货规则单独选实例，并设置「固定天数」「按商品规格」或「每 1 元 = N 天」。
+  多规格商品（天卡/周卡/月卡）会从闲鱼商品详情拉取每个 SKU 的真实价格，逐档设置天数。
 - **卡密池**：按商品分池 + 通用池，出库即锁定（`UPDATE ... WHERE status = available`），不会重复发同一张。
 - **自动确认发货**：可选调用 `mtop.taobao.idle.logistic.consign.dummy` 完成虚拟商品免物流发货。
 - **自动回复**：两条独立的路子 —— **商品自动回复**（买家针对某商品说任何话就回一条）和
@@ -45,12 +48,13 @@ cp .env.example .env      # 填上游配置，见下一节
 **第一步 · 登录闲鱼** —— 点「生成二维码」，用手机闲鱼 App 右上角扫一扫，确认后自动保存账号并开始监听私信。
 扫不出来就退回到「手工粘贴 Cookie」（F12 复制整条，必须含 `unb` 与 `_m_h5_tk`）。
 
-**第二步 · 配置发货规则** —— 选「按订单金额建 Key」，商品 ID 可以直接从「我的在售商品」下拉里选，
-保存前下面会实时显示「订单 ¥10 → $10 额度」这种换算预览。
+**第二步 · 配置发货规则** —— 选「2018K 卡密」，绑定实例，再选「固定天数」「按商品规格」或「每 1 元 = N 天」；
+商品 ID 可以直接从「我的在售商品」下拉里选；多规格商品选「按商品规格」，点「拉取规格」后逐档填天数。
+保存前下面会实时显示这档价格对应多少天。
 
 **第三步 · 试一单** —— 用另一个号拍下付款，看「发货记录」里状态是不是 `delivered`。
 
-> 建议第一次把 `XY_DRY_RUN=1` 打开跑一单。DRY-RUN 只打日志，连订单查询都不做，更不会真去建 Key。
+> 建议第一次把 `XY_DRY_RUN=1` 打开跑一单。DRY-RUN 只打日志，连订单查询都不做，更不会真去建 2018K 卡密。
 
 **可选 · 配自动回复** —— 后台「自动回复」页有两块：
 
@@ -116,172 +120,197 @@ WantedBy=multi-user.target
 日志走 `journalctl -u xianyu-auto-reply -f`。注意：这时候**别再用 `./start.sh start`**，
 两套东西同时管一个服务会互相打架。
 
-## 接上 new-api + new-api-cost（全自动开卡）
+## 接上 2018K 卡密验证平台（全自动建卡密）
 
-你原来的流程是手工三步：新建对应金额的 Key → 导入卡密站生成卡密 → 把卡密发给买家。
-配置好后这三步由程序完成，顺序不变：
+原来的手工流程是：进 2018K 后台建卡密 → 复制卡密 → 回闲鱼发给买家。
+配置好后，程序按发货规则自动完成：
 
 ```
 闲鱼订单实付 ¥10.00
-  └─ 换算额度：10 ÷ 1 = $10.00          （XY_CNY_PER_USD=1，1 元 = 1 美元）
-      └─ new-api  POST /api/token/      建一个额度 $1.37、名为「买家用户名#订单号」的令牌
-          └─ 取回 sk-xxx
-              └─ 卡密站 POST /api/admin/cards  用这个 Key 生成卡密（名称同样是「买家用户名#订单号」）
-                  └─ 卡密发到闲鱼私信 + 自动点「无需物流发货」
+  └─ 规则换算天数：10 × 1 = 10 天          （规则里「每 1 元 = 1 天」）
+      └─ 2018K  GET /v3/createNetworkAuthentication
+           info = AES-CBC(OpenId, {day:10, remark:"买家用户名#订单号"})
+           softwareId = 规则绑定的实例（Miracles / MiraclesX64）
+              └─ 返回卡密 ID（authId，32 位十六进制）
+                  └─ 发到闲鱼私信 + 自动点「无需物流发货」
 ```
+
+> 卡密 ID 就是买家在软件里激活时填的那串。备注里带「买家用户名#订单号」，
+> 后台按买家或订单号都能搜到，方便对账。
 
 ### 前提
 
-- **new-api** 站点可访问，账号能在后台「令牌」页新建令牌；
-- **卡密站（new-api-cost）** 的 `ADMIN_TOKEN` 已填（或用后台账号密码登录）；
-- 卡密站的 `CARDS_SECRET` 已备份 —— 它丢了以后卡密就换不出 Key。
+- 2018K 后台已经创建好实例，能复制到每个实例的 **32 位 softwareId**；
+- 后台「个人中心」能看到 **OpenId**（32 位十六进制）。它同时是 AES 密钥，
+  **不是登录凭据**，不要填到规则或前端；
+- 可选：2018K 后台账号密码。只有配了它，发货失败时才能自动删卡；
+  不配也能发货，但失败后要人工去后台删。
 
 ### 配置
 
-```bash
-# 上游一：new-api
-XY_NEWAPI_BASE_URL=https://api.lumorian.org
-XY_NEWAPI_ACCESS_TOKEN=          # 登录响应里的 access_token，或留空用下面两个
-XY_NEWAPI_USERNAME=
-XY_NEWAPI_PASSWORD=
-XY_NEWAPI_GROUP=                 # 令牌落在哪个分组，留空用默认
-XY_NEWAPI_TOKEN_PREFIX=           # 可选前缀；不填时令牌名就是「买家用户名#订单号」
-XY_NEWAPI_MODEL_LIMITS=deepseek-v4.1-flash   # 仅作默认值；改限制建议用后台「设置」页（留空 = 不限）
-
-# 上游二：卡密站
-XY_CARDSHOP_BASE_URL=https://shop.lumorian.org
-XY_CARDSHOP_ADMIN_TOKEN=
-
-# 换算（1:1 是有意为之：订单 10 元 → $10 额度）
-XY_CNY_PER_USD=1
-XY_MAX_ORDER_CNY=200             # 单笔上限，防标错价被刷；0 = 不限
-```
-
-> **模型限制只作用于新建的 Key。** 之前已经发出去的旧 Key 不会自动补上限制，
-> 需要在 new-api 后台「令牌」页逐个编辑（勾选「模型限制」并填 deepseek-v4.1-flash），
-> 或者让买家换新 Key。
-
-> `quota_per_unit`（$1 = 多少 quota）会实时读 `/api/status`，读不到才用兜底值 500000。
-> 你这台站是 500000，所以 ¥10 → $10 → `remain_quota = 5000000`。
-
-### new-api 凭据怎么拿（两个值，别漏第二个）
-
-需要用 **access_token** 和 **user_id** 两个值，原因见下。
-
-**① user_id（New-Api-User）**
-
-new-api 0.13.x 起，所有 `/api/*` 后台接口都强制要求请求头带 `New-Api-User: <你的用户id>`，
-少这个头直接 401 —— 报错是 `Unauthorized, New-Api-User header not provided`。
-
-拿法（任选一）：
-
-- 登录 <https://api.lumorian.org> → 右上角头像 → 个人设置，页面上能看到用户 ID；
-- 或直接看数据库 `SELECT id FROM users WHERE username='你的用户名';`；
-- 或 F12 → Network → 任意一个 `/api/user/self` 请求 → 看请求头里的 `New-Api-User`。
-
-**② access_token（系统访问令牌）**
-
-这是**长期有效**的凭据（不像登录态那样过期），正是给脚本用的：
-
-1. 登录 <https://api.lumorian.org>；
-2. 进「个人设置」（右上角头像 → 个人设置）；
-3. 找到 **「系统访问令牌」/「访问令牌」/ Access Token** 那一栏；
-4. 点「生成」/「重置」按钮，复制出来的那串就是。
-
-> 它是 base64 风格的随机串（约 40 字符），**不是** `sk-` 开头的 API Key。
-> `sk-` 那些是「令牌」页里给客户端调模型用的，跟这个不是一回事，别搞混。
-
-也可以直接调接口生成（用浏览器登录态）：
+推荐直接在后台「设置」页填写 OpenId、增删实例、配置后台账号，保存即生效；下面的 `.env` 是可选的初始值。
 
 ```bash
-# 在浏览器已登录的前提下，从 F12 → Network 复制 Cookie，然后：
-curl -X GET 'https://api.lumorian.org/api/user/token' \
-  -H 'New-Api-User: <你的user_id>' \
-  -H 'Cookie: <浏览器Cookie>'
-# 返回 {"success":true,"data":"<access_token>"}
+# 2018K 公开 API
+XY_2018K_OPENID=你的32位OpenId
+# 名称=softwareId，多个用逗号 / 分号 / 换行分隔；规则里按名称选择
+XY_2018K_INSTANCES=Miracles=实例ID1,MiraclesX64=实例ID2
+XY_2018K_API_BASE=https://api.2018k.cn/v3
+
+# 可选：后台账号，用于发货失败时删卡（不配就只能人工删）
+XY_2018K_ADMIN_BASE=https://admin.2018k.cn
+XY_2018K_ADMIN_USERNAME=
+XY_2018K_ADMIN_PASSWORD=
+
+# 订单金额上限，防标错价被刷；0 = 不限
+XY_MAX_ORDER_CNY=200
 ```
 
-**③ 其实还有个更省事的办法**
+面板保存后立即生效，不用重启；规则页顶部的横幅会显示「2018K 已接通」和实例列表。
 
-不填 access_token，直接填账号密码：
+侧栏现在会显示闲鱼账号聚合状态（在线 / 连接中 / 未连接）和 2018K 最近一次探测结果；
+2018K 只在启动、保存配置或点「重新检测」时用 obtainSoftware 探测，不做定时轮询，避免长期请求触发上游防护。
+断网后状态不会自动变红，需要手动检测；建卡失败时也会把最近状态标成「连接异常」。
 
-```bash
-XY_NEWAPI_USERNAME=你的用户名
-XY_NEWAPI_PASSWORD=你的密码
-```
+### 实例 ID 从哪来
 
-程序登录时会自动从响应里拿 user id 和 access_token，**这两个都不用你填**。
-代价是把密码写进 `.env`（文件权限设 600），并且每次启动多一次登录请求。
+2018K 后台 →「实例管理」→ 每个实例的 32 位 ID。**公开 API 没有「列出实例」接口**，
+OpenId 也拉不到实例列表（后台列表接口需要登录 token）。实例 ID 从 2018K 后台复制后，在后台「设置」页添加（也可以写
+`XY_2018K_INSTANCES`），程序启动时用 `obtainSoftware` 逐个自检。
 
-> ⚠️ 光有 access_token 是**没法自动补 user_id** 的 —— 因为查用户信息本身就要 New-Api-User 头。
-> 所以要么用账号密码，要么两个值都手工填。
+### 卡密时长怎么算
 
-### 卡密站凭据
+**每个商品单独建一条规则**，在规则弹窗里设置这个商品的卡密时长；弹窗会显示当前商品的价格。
 
-`https://shop.lumorian.org` 已内置为默认地址。凭据二选一：
+| 方式 | 说明 |
+| --- | --- |
+| 按本商品固定天数（默认） | 这个商品每单固定 N 天，不看订单金额；查不到金额也能发 |
+| 按商品规格（天卡/周卡/月卡） | 从商品详情拉取每个 SKU 的价格，逐档设置天数（如 ¥1=1 天、¥5=7 天、¥10=30 天） |
+| 按订单金额换算（多档价格） | 天数 = 订单实付金额 × 「每 1 元 = N 天」，四舍五入，至少 1 天 |
+| 永久卡 | 在「本商品固定天数」或规格档位里填 **0**；2018K 以 day/hour/minute 全 0 表示永久 |
 
-- `XY_CARDSHOP_ADMIN_TOKEN`：卡密站 `.env` 里的 `ADMIN_TOKEN`（默认是空的，需要你填一个）；
-- 或 `XY_CARDSHOP_USERNAME` / `XY_CARDSHOP_PASSWORD`：后台管理员账号密码。
+多规格商品注意：闲鱼「我发布的」列表接口只返回最低价（soldPrice），
+所以天卡/周卡/月卡必须点「拉取规格」，走商品详情接口 mtop.taobao.idle.pc.detail
+的 data.itemDO.skuList；接口里的价格单位是**分**，程序已换算成元。
 
-> 卡密站首次部署后必须先登录 `/admin` 改掉 `admin`/`admin`，
-> 否则所有业务接口返回 428「首次登录必须先修改密码」。
+例：商品 ¥1，选「固定 30 天」→ 每单 30 天；选「每 1 元 = 1 天」→ 每单 1 天。
+档位模式按订单实付金额匹配：先找完全一致的一档，差几分钱时取最接近且差距不超过
+max(1 元, 档位价 30%) 的一档；差太远会明确失败，不猜。
+按金额换算时，订单 ¥9.5 → 10 天（half-up），订单 ¥0.4 → 至少 1 天；
+金额或倍率不是正数时不发货，不会静默发 0 天卡。
 
-### 上线前先自查
-
-管理后台「发货规则」上方会显示一行状态：
-
-- ✅ **上游已接通** —— 可以选「按订单金额建 Key」了
-- ⚠️ **上游未配置齐全** —— 上面那些环境变量还缺
-
-再打开 `XY_DRY_RUN=1`（只打日志不真发，**也不会真的去建 Key**），用测试账号拍一单看日志，
-确认金额/额度换算对了再关掉。
+永久卡填 **0**，不要填 -1；按金额换算模式始终至少 1 天，不能生成永久卡。
+发货文案里的 {days} 在永久卡会渲染成「永久」；模板写「{days} 天」时程序会自动去掉多余的「天」。
 
 ### 失败时会怎样
 
 | 情况 | 行为 |
 | --- | --- |
-| 查不到订单金额，且规则填了固定额度 | 用固定额度继续发货 |
-| 查不到订单金额，也没填固定额度 | 不发，记 `upstream_failed`（原因：查不到订单金额） |
+| 规则没选实例 | 不发，记 `upstream_failed`（原因：规则未选择 2018K 实例） |
+| 查不到订单金额，且是固定天数 | 用固定天数继续发货 |
+| 查不到订单金额，且是按金额换算 / 按商品规格 | 不发，记 `upstream_failed`（原因：查不到订单金额） |
 | 金额超过 `XY_MAX_ORDER_CNY` | 不发，记 `upstream_failed`（原因：订单金额超上限） |
-| new-api 建令牌失败 | 不发，记 `upstream_failed` |
-| 令牌建好了但卡密生成失败 | **自动删除刚建的令牌**，不发，记 `upstream_failed` |
-| 卡密生成好了但闲鱼消息发不出去 | 记 `send_failed`，卡密留在记录里可人工补发 |
+| 2018K 建卡密失败 | 不发，记 `upstream_failed`（原因带 2018K 返回的 message） |
+| 确认发货失败（如 `ORDER_STATUS_ERROR`） | **不发送卡密**，记 `confirm_failed`；2018K 卡密尝试自动删除，删不掉则把卡密 ID 写进详情 |
+| 订单已发货（`ORDER_ALREADY_DELIVERY`） | 视为已发货，允许发送卡密，记 `delivered` |
+| 卡密建好了但闲鱼消息发不出去 | 记 `send_failed`；配了后台账号会自动删卡，没配则把卡密 ID 写进详情，人工删 |
+
+事后查事故：
 
 ```sql
--- 事后查事故：看看哪些订单没发出去
-SELECT created_at, order_id, status, detail FROM orders WHERE status != 'delivered';
+SELECT created_at, order_id, status, duration_days, card_code, detail
+FROM orders WHERE status != 'delivered';
 ```
 
-### Key 能调哪些模型（后台直接改）
+### 2018K 提示「请求数据已经过期」
 
-打开后台左侧「**设置**」页 → **Key 模型限制**：
+2018K 的 `createNetworkAuthentication` 请求里带 `info.times` 客户端时间戳。
+如果服务器时钟偏差过大，上游会把请求判为过期；此时：
 
-1. 填允许的模型，逗号 / 空格 / 换行分隔都行（中文逗号也可以），例如 `deepseek-v4.1-flash, deepseek-v4.1`；
-2. 点「保存设置」——**立刻对新订单生效，不用重启、也不用改 .env**。
+- 面板的「重新检测」调用的是 `obtainSoftware`，不带 `times`，所以可能显示连接正常；
+- 建卡失败只影响当前订单，记 `upstream_failed`，**不应该把 2018K 连接状态翻成异常**；
+- 现在建卡失败不会再修改全局健康状态，面板连接状态只反映实例自检 / 后台登录。
 
-页面会实时显示「保存后新 Key 会变成这样」，也就是实际下发给 new-api 的
-`model_limits_enabled` / `model_limits`。
+排查时先比较本机与公共时间：
 
-- **留空 = 不限制模型**（买家拿 Key 能调任意模型）。这种状态顶部会挂一条红色警告，规则页的横幅也会标红。
-- 保存过的值存在数据库 `app_config` 表里，**优先级高于 `.env` 的 `XY_NEWAPI_MODEL_LIMITS`**；
-  `.env` 里那个值只在后台从没保存过时作为默认值（老部署升级上来行为不变）。
-- 只影响**之后新建**的 Key。已经发出去的旧 Key 是建令牌时就写死在 new-api 里的，
-  要收紧得去 new-api 后台逐个改。
-- 这里只存运营参数（模型白名单）。access_token、密码这类凭据仍然只从 `.env` 读，不会写进数据库。
+```bash
+date -u
+curl -sI https://www.baidu.com | grep -i '^date:'
+```
 
-> 注意：这道保护依赖 new-api 自己的 `model_limits`，改了要确认 new-api 版本支持
-> （0.13.x 需要同时带 `model_limits_enabled: true`，本工具已经这么发了）。
+两者相差几十秒就应先校时（NTP 或手动同步），否则会出现「连接正常但每单建卡都提示过期」。
+
+### 删除卡密 / 回滚
+
+2018K **公开 API 不提供删除卡密接口**（`/v3/delAuth` 等路径实测都是 404）。
+删除只能走后台：
+
+- 配了 `XY_2018K_ADMIN_USERNAME / XY_2018K_ADMIN_PASSWORD`：
+  程序登录 `/api/adm/login` 拿 token，再调 `/api/adm/delAuth` 删卡；
+- 没配：失败记录里会写明卡密 ID，请到 2018K 后台手动删除。
+
+> 后台密码保存在本机 SQLite；前端只显示「已配置」，不回显密码。
+
+### 上线前自查
+
+1. 规则页横幅显示 ✅ **2018K 已接通**，实例列表和后台一致；
+2. 先开 `XY_DRY_RUN=1`，用测试账号拍一单，看日志里的「金额 → 天数」是否对；
+3. 关掉 DRY-RUN 真跑一单，确认「发货记录」里状态是 `delivered`、2018K 后台能看到这张卡密；
+4. 故意把实例 ID 改错一次，确认日志里能明确报「实例自检失败」，而不是静默不发。
+
+## 接 MiniDailyReward 扫码入池（可选新发货模式）
+
+MiniDailyReward 的控制台部署在同一台服务器时，xianyu-auto-reply 可以直接调用它的
+`POST /api/invites` 生成一次性入池邀请，把**邀请链接**发给买家。买家打开链接后自己填写
+迷你号/密码，MiniDailyReward 校验登录成功后按规则设定的天数入池。
+
+- 二维码/链接由 MiniDailyReward 生成，**闲鱼只发文本链接，不发送二维码图片**；
+- 链接默认 **10 分钟有效、只能提交一次**；
+- 规则里的「二维码挂载天数」就是 MiniDailyReward 的 `days` 参数，填 **0 = 永久**；
+- 每个商品单独建规则；时长计算方式与 2018K 一样，支持「固定天数」「按商品规格」「按订单金额换算」。
+
+`.env`：
+
+```bash
+# 同一台机器上的 MiniDailyReward 控制台
+XY_MINIDAILY_API_BASE=http://127.0.0.1:8790
+# 令牌在 /opt/miniworld/webui-token.txt，只写本机 .env，不要提交/回显
+XY_MINIDAILY_TOKEN=你的控制台令牌
+```
+
+规则弹窗选「MiniDaily 二维码（扫码入池）」，填挂载天数；保存后新订单会生成链接并发送。
+失败会记 `invite_failed`，详情里带 MiniDaily 返回的错误；已生成的邀请过期后自动失效，无需删卡。
+
+## 订单自动化（求小红花 / 提醒收货 / 评价）
+
+后台「设置 → 订单自动化」有三个默认关闭的开关：
+
+| 开关 | 行为 |
+| --- | --- |
+| 自动领取小红花 | 买家送小红花时自动调用领取接口，不需要手动点「立即收下」；默认开启 |
+| 自动求小红花 | 对「已发货 / 交易成功」订单调用闲鱼求小红花接口，每个订单只发一次 |
+| 自动提醒收货 | 对「已发货 / 等待见面交易」订单提醒买家确认收货；同一订单每天最多一次；接口返回「今日已提醒过，请勿重复提醒」会记为今日已完成 |
+| 自动好评 | 对「交易成功」且尚未评价的订单发 5 星好评，内容取自设置里的「好评内容」 |
+
+安全约束：
+
+- 只有**开启时刻之后创建**的订单会被处理；不会回溯历史订单；
+- 默认全部关闭；
+- 提醒收货按自然日去重，求花/评价按订单去重；
+- 评价内容为空时不会自动评价；
+- 由系统交易消息触发，**不做订单轮询**：收到「买家已确认收货，交易成功」的卡片才执行评价/求花；
+  收到「你已发货」等发货提示时执行提醒收货/求花。
 
 ## 发货规则怎么配
 
 | 字段 | 说明 |
 | --- | --- |
 | 商品 ID | 目标商品 ID；`*` 为通配规则。有商品专属规则时优先用它 |
-| 模式 | `upstream` 按订单金额建 Key（推荐）；`card` 本地卡密池；`text` 固定文案 |
-| 发货文案 | 支持变量 `{card}` `{buyer}` `{item_id}` `{order_id}` `{date}` `{amount}` `{quota}` |
-| 金额倍率 | 上游模式：额度 = 订单金额 ÷ 汇率 × 倍率 |
-| 固定额度 | 上游模式：填了就忽略订单金额，直接建这么多 USD 的 Key |
-| 自动确认 | 勾选后，文案发完会调用免物流发货接口把订单标记成已发货 |
+| 模式 | `upstream` 2018K 卡密（推荐）；`minidaily` MiniDailyReward 扫码入池；`card` 本地卡密池；`text` 固定文案 |
+| 发货文案 | 支持变量 `{card}` `{qr_url}` `{buyer}` `{item_id}` `{order_id}` `{date}` `{amount}` `{days}`（`{quota}` 作为 `{days}` 的别名保留） |
+| 2018K 实例 | 上游模式必填：这条规则在哪个实例上建卡密（Miracles / MiraclesX64） |
+| 卡密时长 | 上游模式：默认「本商品固定天数」；多规格选「按商品规格」逐档设天数；也可选「每 1 元 = N 天」 |
+| 自动确认 | 勾选后，**先**调用免物流发货接口确认成功，再发送卡密；确认失败（如 ORDER_STATUS_ERROR）不发送卡密，订单记为 confirm_failed |
 | 优先级 | 数字越大越优先（同商品多规则时） |
 
 典型文案：
@@ -295,6 +324,8 @@ SELECT created_at, order_id, status, detail FROM orders WHERE status != 'deliver
 ## 自动回复怎么配
 
 后台「自动回复」页分成两块，规则字段几乎一样：
+
+> 系统交易消息（收货、评价、付款、交易卡片等）**永远不会触发自动回复**，即使命中了关键词规则也不会回复。
 
 | 字段 | 说明 |
 | --- | --- |
@@ -362,6 +393,10 @@ SELECT created_at, order_id, status, detail FROM orders WHERE status != 'deliver
 只记已读不回复 —— 否则一重启就会把昨天的消息全部自动回复一遍。
 比连接时刻晚的（哪怕只早到几百毫秒）照常处理，不会漏掉启动瞬间到达的那条。
 
+**旧会话保护**：如果会话最后一条消息距当前超过 `XY_MESSAGE_STALE_SECONDS`（默认 86400 秒 = 1 天），
+整个会话的历史都忽略，不记录、不自动回复、不触发发货；只处理之后到达的新消息。
+即使旧会话后来重新活跃，补拉历史时也会按同一时间窗口过滤掉旧消息，避免“新消息一进来就把旧消息全回一遍”。
+
 > 代价是自动回复的延迟约等于 `XY_MESSAGE_POLL_INTERVAL`（默认 20 秒）。
 > 想更即时可以调到 10，但别低于 5：这是每次都要打一次 WebSocket RPC 的路径。
 
@@ -392,25 +427,9 @@ SELECT created_at, order_id, status, detail FROM orders WHERE status != 'deliver
 | `已自动回复 X：命中商品自动回复「…」` | 真的发出去了 |
 | `不自动回复：命中的规则都在冷却或已回过` | 规则命中了，但被「会话只回一次」或冷却挡住 |
 
-### 额度按站点货币换算（重要）
-
-new-api 的 `quota` 是按**站点展示货币**计价的，由后台 `quota_display_type` 决定：
-
-| 站点货币 | 换算 | 1 元订单得到 |
-| --- | --- | --- |
-| `USD` | `quota = 金额 × quota_per_unit` | 500000 quota = $1 |
-| `CNY`（汇率 7.3） | `quota = 金额 ÷ 7.3 × quota_per_unit` | ≈68493 quota = **¥1** |
-| `CUSTOM` | 按 `custom_currency_exchange_rate` | 同 CNY 逻辑 |
-
-程序启动时会读 `/api/status` 拿到 `quota_display_type` / `usd_exchange_rate` 自动换算，
-**不需要你手动补偿**。后台「发货规则」页的额度预览也会跟着显示 $ 或 ¥，避免误读。
-
-> 历史坑：早期版本无条件把 `quota_per_unit` 当成「$1 = 500000」。在 CNY 站点上
-> 这会让 1 元订单发出 ¥7.30 的额度（多给 7.3 倍）。已修复，且有回归测试锁住。
-
 ## 配置项
 
-全部走环境变量（启动时自动读取工作目录下的 `.env`，模板见 `.env.example`）：
+环境变量提供默认值（启动时自动读取工作目录下的 `.env`，模板见 `.env.example`）；2018K 接入配置在后台「设置」页保存后写入 SQLite，并优先于 `.env`：
 
 | 变量 | 默认 | 作用 |
 | --- | --- | --- |
@@ -420,7 +439,7 @@ new-api 的 `quota` 是按**站点展示货币**计价的，由后台 `quota_dis
 | `XY_ADMIN_ALLOW_REMOTE` | `0` | **没配口令时的兜底**：默认只允许本机访问管理接口；改成 `1` 才会对外网放行（除非前面已经有反代鉴权，否则不要开） |
 | `XY_DELIVERY_COOLDOWN` | `600` | 同一订单的重复发货冷却秒数 |
 | `XY_SEND_RETRY` | `2` | 发送失败重试次数 |
-| `XY_DRY_RUN` | `0` | 只打日志不真发（也不会真的建 Key） |
+| `XY_DRY_RUN` | `0` | 只打日志不真发（也不会真的建 2018K 卡密） |
 | `XY_LOG_LEVEL` | `INFO` | 日志级别 |
 | `XY_LOG_FILE` | `./logs/server.log` | 日志文件（自动轮转）；留空只输出到控制台 |
 | `XY_LOG_MAX_BYTES` | `10485760` | 单个日志上限（10 MB） |
@@ -432,31 +451,26 @@ new-api 的 `quota` 是按**站点展示货币**计价的，由后台 `quota_dis
 | `XY_MESSAGE_POLL_LIMIT` | `20` | 每次拉多少个会话（最多 50） |
 | `XY_MESSAGE_HISTORY_LIMIT` | `20` | 发现新消息时往回补拉多少条历史（最多 50） |
 | `XY_MESSAGE_HISTORY_CONVERSATIONS` | `5` | 每轮最多给几个会话补拉历史；0 = 只看最后一条 |
+| `XY_MESSAGE_STALE_SECONDS` | `86400` | 旧会话保护：会话最后一条超过 1 天就整段忽略；0 = 关闭（不推荐） |
 | `XY_SYNC_POLL_INTERVAL` | `30` | ackDiff 同步位点重发间隔（秒），0 = 只发一次（不推荐） |
 | `XY_HEARTBEAT_INTERVAL` | `10` | WebSocket 心跳间隔（秒）。首跳立即发，必须在注册之前 |
 | `XY_REGISTER_GAP` | `1` | `/reg` 与 ackDiff 之间的间隔（秒），太小会导致注册不生效 |
 | `XY_AUTO_REPLY` | `1` | 自动回复总开关；0 = 全关（只发货，不搭理） |
 | `XY_AUTO_REPLY_DELAY` | `1` | 自动回复前等几秒，避免「秒回」像机器人；0 = 立刻回 |
-| `XY_CNY_PER_USD` | `1` | 多少元 = 1 美元额度 |
 | `XY_ORDER_POLL_INTERVAL` | `30` | 订单轮询间隔（秒），0 = 关闭。这是「完全没有推送」时的兜底节奏 |
 | `XY_ORDER_HINT_POLL_GAP` | `5` | 收到推送后最少隔几秒才允许再补查一次订单；0 = 关闭加速。查不到东西会自动放慢到最多 30 秒 |
 | `XY_ORDER_POLL_CONCURRENCY` | `3` | 一轮轮询里同时处理几张待发货订单，1 = 串行 |
 | `XY_ORDER_CACHE_TTL` | `30` | 同一订单详情缓存秒数（补商品 ID 与取金额共用一次查询），0 = 不缓存 |
 | `XY_ORDER_AMOUNT_UNIT` | `auto` | 订单金额单位：`auto` / `yuan` / `fen` |
 | `XY_MAX_ORDER_CNY` | `0` | 单笔订单金额上限（元），0 = 不限 |
-| `XY_NEWAPI_BASE_URL` | 空 | new-api 站点地址 |
-| `XY_NEWAPI_ACCESS_TOKEN` | 空 | new-api 后台 access_token |
-| `XY_NEWAPI_USERNAME` / `XY_NEWAPI_PASSWORD` | 空 | 没给 token 时用它俩自动登录 |
-| `XY_NEWAPI_GROUP` | 空 | 令牌分组 |
-| `XY_NEWAPI_TOKEN_PREFIX` | 空 | 可选前缀。令牌名 = `[前缀]买家用户名#订单号`，整体控制在 50 字节内；超长时先截用户名、订单号保持完整 |
-| `XY_NEWAPI_MODEL_LIMITS` | `deepseek-v4.1-flash` | 新建 Key 只允许使用的模型（逗号分隔）；留空 = 不限制，慎用。**仅在后台「设置」页没保存过时生效**，优先级低于后台 |
-| `XY_NEWAPI_QUOTA_PER_UNIT` | 空 | $1 对应多少 quota，留空自动读 /api/status |
-| `XY_CARDSHOP_BASE_URL` | `https://shop.lumorian.org` | 卡密站地址 |
-| `XY_CARDSHOP_ADMIN_TOKEN` | 空 | 卡密站管理令牌 |
-| `XY_CARDSHOP_GROUPS` | `5` | 卡密分组数 |
+| `XY_2018K_OPENID` | 空 | 2018K OpenId（32 位十六进制，同时是 AES 密钥） |
+| `XY_2018K_INSTANCES` | 空 | 实例列表，如 `Miracles=实例ID1,MiraclesX64=实例ID2` |
+| `XY_2018K_API_BASE` | `https://api.2018k.cn/v3` | 2018K 公开 API 地址 |
+| `XY_2018K_ADMIN_BASE` | `https://admin.2018k.cn` | 2018K 后台地址（删卡用；程序会拼 `/api/adm/*`） |
+| `XY_2018K_ADMIN_USERNAME` / `XY_2018K_ADMIN_PASSWORD` | 空 | 可选；配了才能在发货失败时自动删卡 |
 
-> 卡密名称固定为 `买家用户名#订单号`（与令牌名一致，不带价格和平台前缀）。
-> 原先的 `XY_CARDSHOP_LABEL` 名称前缀已下线，配了也不会生效。
+> 卡密备注固定为 `买家用户名#订单号`（不带价格和平台前缀）。
+> 2018K 的 OpenId、后台密码可在后台「设置」页填写，保存在本机 SQLite；前端不回显，保存后即时生效。
 
 ## 代码结构
 
@@ -466,10 +480,11 @@ app/config.py      环境变量配置
 app/sign.py        mtop 签名 / 设备指纹 / Cookie 解析
 app/codec.py       msgpack+base64 解包、卡片消息里提 itemId / orderId
 app/client.py      mtop HTTP + WebSocket 长连接、发消息、确认发货
-app/engine.py      发货规则匹配 → 卡密出库 / 上游建 Key → 文案渲染（纯逻辑，好测）
+app/engine.py      发货规则匹配 → 卡密出库 / 天数换算 → 文案渲染（纯逻辑，好测）
 app/autoreply.py   自动回复匹配（商品 / 关键词）→ 文案渲染（纯逻辑，好测）
-app/money.py       订单金额解析（元/分自动识别）与额度换算
-app/upstream.py    new-api 建令牌 + 卡密站生成卡密的客户端
+app/money.py       订单金额解析（元/分自动识别）
+app/k2018.py       2018K 公开 API / 后台 API 客户端（AES 加密、建卡、删卡）
+app/upstream.py    2018K 建卡门面：实例校验、建卡、失败回滚、备注命名
 app/qrlogin.py     闲鱼扫码登录（passport 二维码流程）
 app/db.py          SQLite 存储（账号 / 规则 / 卡密 / 订单 / 消息）
 app/runner.py      账号级 Worker：连接、收帧、回执、决策、发货、记录
@@ -477,7 +492,7 @@ app/web.py         FastAPI 管理接口 + 内嵌 HTML 后台
 app/daemon.py      进程控制：pid 文件、单实例锁、SIGTERM/SIGKILL、端口等待
 start.sh           唯一入口：自动建 venv / 装依赖，再转给 ctl.py
 ctl.py             启停子命令实现（一般不用直接调）
-tests/             338 个单元 / 集成测试，全部离线运行
+tests/             约 300 个单元 / 集成测试，全部离线运行
 ```
 
 ## 测试
@@ -504,6 +519,13 @@ tests/             338 个单元 / 集成测试，全部离线运行
   全都没有才退回「买家」；一旦拿到真名，同一个人历史上记成「买家」的订单/消息会一并回填。
   只有付款触发语在名字还没落定时才会为此多查一次订单，其它情况复用已在缓存里的订单详情。
 - 上游模式依赖闲鱼「卖家订单列表」接口拿金额；接口字段变了会退回 `upstream_failed` 并在 `detail` 里写明原因，不会瞎发。
+- **2018K 公开 API 没有「列实例」和「删卡密」接口**：实例 ID 从 2018K 后台复制后，在面板「设置」页添加（也可写 `XY_2018K_INSTANCES`）；
+  删卡只能配 `XY_2018K_ADMIN_USERNAME / XY_2018K_ADMIN_PASSWORD` 走后台 `/api/adm/delAuth`，
+  不配就在失败记录里留下卡密 ID 人工处理。
+- 2018K 卡密 ID（authId）就是买家激活时填的那串，程序按接口原样发出去；
+  买家怎么用取决于你软件的激活界面，发货文案里最好把使用说明一起写上。
+- 天数换算使用 half-up 四舍五入且至少 1 天；固定天数模式不依赖订单金额，按金额换算 / 按商品规格模式查不到金额会明确失败而不是发 0 天卡。
+- 多规格商品列表只显示最低价，必须点「拉取规格」读商品详情；详情里的 SKU 价格单位是分，已换算成元。
 - 订单轮询路径需要先 `create_chat` 建会话才能发消息。回包必须由收帧主循环分发（`dispatch`），
   **不能在业务代码里再开一个 `recv`** —— websockets 会报 `cannot call recv while another coroutine is already running recv`。
 - 闲鱼的消息推送格式有三代：**嵌套数字键**（`"1"` → `"6"` → `"3"`，真正的聊天消息）、

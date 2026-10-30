@@ -93,11 +93,11 @@ class FakeProvisioner:
     def __init__(self):
         self.calls = []
 
-    async def provision(self, quota_usd, label, username=""):
+    async def provision(self, software_id, days, label, username=""):
         from app.upstream import Provisioned
 
-        self.calls.append((quota_usd, label))
-        return Provisioned("CARD-POLL-1", "sk-a…z", quota_usd, "1")
+        self.calls.append((days, label))
+        return Provisioned("CARD-POLL-1", "sk-a…z", days, software_id)
 
 
 async def build(db, orders):
@@ -113,7 +113,7 @@ UPSTREAM_RULE = {
     "name": "按金额", "item_id": ITEM_ID, "enabled": True, "mode": "upstream",
     "content": "你好 {buyer}，卡密：{card}\n额度 {quota} USD",
     "auto_confirm": True, "priority": 0, "remark": "",
-    "usd_multiplier": 1.0, "fixed_usd": 0.0,
+    "software_id": "B4ADC92FDF7240398D8A80A4176C80BD", "duration_mode": "per_amount", "fixed_days": 0, "days_per_cny": 1.0,
 }
 
 

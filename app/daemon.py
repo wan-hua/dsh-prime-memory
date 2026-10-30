@@ -46,6 +46,9 @@ from typing import Any
 STOP_TIMEOUT = 15.0
 #: 端口释放等待上限（秒）。SIGTERM 之后内核回收 socket 通常瞬间完成。
 PORT_RELEASE_TIMEOUT = 5.0
+#: Windows 没有 SIGKILL，强制停止用 TerminateProcess（os.kill 会走这条路）
+SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
 #: 轮询间隔（秒）
 POLL_INTERVAL = 0.1
 #: 入口脚本名，用来核对 pid 是不是我们自己
@@ -87,15 +90,42 @@ class Health:
 # ------------------------------------------------------------------ 纯判断
 
 
+def _windows_pid_alive(pid: int) -> bool:
+    """Windows 下判断进程是否还活着。
+
+    不能用 `os.kill(pid, 0)`：Windows 的 os.kill 对非 Ctrl 事件会走
+    TerminateProcess，语义完全不是「探测」。用 OpenProcess +
+    GetExitCodeProcess 只读查询，避免把服务误杀。
+    """
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def is_pid_alive(pid: int) -> bool:
     """这个 pid 现在是否存在（僵尸进程算不存在）。
 
-    `os.kill(pid, 0)` 只是探测权限/存在性，不会真的发信号。
+    POSIX 下 `os.kill(pid, 0)` 只是探测权限/存在性，不会真的发信号；
+    Windows 下不能用它，改走 OpenProcess（见 _windows_pid_alive）。
     /proc 里状态是 Z 的进程已经退出、只是还没被父进程回收，
     不能当成「服务在跑」——否则会出现「停不掉」的假象。
     """
     if pid <= 0:
         return False
+    if sys.platform.startswith("win"):
+        return _windows_pid_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -381,7 +411,7 @@ class ProcessController:
         pid = health.info.pid
         wait_for = self.stop_timeout if timeout is None else timeout
 
-        sig = signal.SIGKILL if action == "kill" else signal.SIGTERM
+        sig = SIGKILL if action == "kill" else signal.SIGTERM
         self._signal(pid, sig)
 
         graceful = action == "term" and wait_until(
@@ -390,7 +420,7 @@ class ProcessController:
         killed = False
         if not graceful and is_pid_alive(pid):
             # 没体面退出（或者本来就要求强制）：直接 SIGKILL
-            self._signal(pid, signal.SIGKILL)
+            self._signal(pid, SIGKILL)
             killed = True
             wait_until(lambda: not is_pid_alive(pid), 5.0)
 

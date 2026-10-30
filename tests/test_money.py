@@ -1,10 +1,10 @@
-"""订单金额解析与额度换算的单元测试。"""
+"""订单金额解析与 2018K 卡密天数换算的单元测试。"""
 
 from __future__ import annotations
 
 import pytest
 
-from app.engine import quota_from_amount
+from app.engine import days_from_amount
 from app.money import AmountError, parse_amount, pick_amount
 
 
@@ -90,14 +90,16 @@ def test_pick_amount_without_amount_field():
 
 
 @pytest.mark.parametrize(
-    ("cny", "multiplier", "fixed", "rate", "expected"),
+    ("cny", "days_per_cny", "expected"),
     [
-        (10, 1, 0, 1, 10.0),
-        (10, 2, 0, 1, 20.0),
-        (10, 1, 5, 1, 5.0),
-        (10, 1, 0, 7.2, 1.39),
-        (66, 1, 0, 7.2, 9.17),
+        (10, 1, 10),
+        (10, 2, 20),
+        (9.5, 1, 10),      # half-up：9.5 元给 10 天，不能按银行家舍入给 10/9 跳
+        (0.4, 1, 1),       # 至少 1 天，避免出现 0 天卡
+        (0, 1, 0),
+        (10, 0, 0),
+        (-1, 1, 0),
     ],
 )
-def test_quota_from_amount(cny, multiplier, fixed, rate, expected):
-    assert quota_from_amount(cny, multiplier, fixed, rate) == pytest.approx(expected)
+def test_days_from_amount(cny, days_per_cny, expected):
+    assert days_from_amount(cny, days_per_cny) == expected

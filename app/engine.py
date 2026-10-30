@@ -1,10 +1,11 @@
-"""发货决策引擎：规则匹配 → （卡密出库 | 上游建 Key 出卡密）→ 渲染发货文案。
+"""发货决策引擎：规则匹配 → （卡密出库 | 2018K 建卡密）→ 渲染发货文案。
 
 这一层不碰网络，纯函数 + 数据库读写，方便单元测试。
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -23,23 +24,28 @@ AUTH_BLOCKED_REASON = "真人文本消息，订单未经核实，不自动发货
 class Decision:
     """一条消息的处理结论。"""
 
-    action: str  # "deliver" | "skip"
+    action: str  # "deliver" | "provision" | "invite" | "skip"
     reason: str = ""
     rule: dict[str, Any] | None = None
     content: str = ""
     card_id: int | None = None
     card_code: str | None = None
     amount_cny: float | None = None
-    quota_usd: float | None = None
+    #: 2018K 卡密天数（旧的 quota_usd 已随 new-api 一起移除）
+    days: int | None = None
     auto_confirm: bool = False
 
     @property
     def should_deliver(self) -> bool:
-        return self.action in ("deliver", "provision")
+        return self.action in ("deliver", "provision", "invite")
 
     @property
     def needs_provision(self) -> bool:
         return self.action == "provision"
+
+    @property
+    def needs_invite(self) -> bool:
+        return self.action == "invite"
 
 
 def pick_rule(rules: list[dict[str, Any]], item_id: str | None) -> dict[str, Any] | None:
@@ -62,35 +68,99 @@ def pick_rule(rules: list[dict[str, Any]], item_id: str | None) -> dict[str, Any
 
 def render(template: str, *, buyer_name: str = "", item_id: str | None = None,
            order_id: str | None = None, card: str = "",
-           amount_cny: float | None = None, quota_usd: float | None = None) -> str:
-    """渲染发货文案，支持 {buyer} {item_id} {order_id} {card} {date} {amount} {quota}。"""
+           amount_cny: float | None = None, days: int | None = None,
+           qr_url: str = "") -> str:
+    """渲染发货文案，支持 {buyer} {item_id} {order_id} {card} {qr_url} {date} {amount} {days}。
+
+    旧模板里的 {quota} 保留为 {days} 的别名，避免升级后老文案里的占位符变成空。
+    """
     values = {
         "buyer": buyer_name or "买家",
         "item_id": item_id or "",
         "order_id": order_id or "",
         "card": card,
+        "qr_url": qr_url,
         "date": time.strftime("%Y-%m-%d %H:%M:%S"),
         "amount": "" if amount_cny is None else f"{amount_cny:.2f}",
-        "quota": "" if quota_usd is None else f"{quota_usd:.2f}",
+        # 0 天在 2018K 约定为永久卡；文案里直接显示「永久」，不显示 0
+        "days": "" if days is None else ("永久" if int(days) == 0 else str(int(days))),
     }
+    values["quota"] = values["days"]
     out = template or ""
+    if days is not None and int(days) == 0:
+        # 0 天是永久卡；顺手去掉「{days} 天」后面的「天」，避免出现「永久 天」
+        for key in ("days", "quota"):
+            out = out.replace("{" + key + "} 天", "永久").replace("{" + key + "}天", "永久")
     for key, value in values.items():
         out = out.replace("{" + key + "}", str(value))
     return out
 
 
-def quota_from_amount(amount_cny: float, multiplier: float = 1.0, fixed_usd: float = 0.0,
-                      cny_per_usd: float = 1.0) -> float:
-    """订单金额（元）→ 上游额度（USD）。
+def parse_price_tiers(raw: Any) -> list[dict[str, Any]]:
+    """把规则里的 `price_tiers` 解析成干净的档位列表。
 
-    fixed_usd > 0 时直接用它（一口价场景）；否则按汇率换算后再乘倍率。
-    结果保留两位小数，避免拿到 9.999999 这种额度。
+    存储形态是 JSON 字符串（数据库 TEXT），也允许直接传 list（测试 / 内部调用）。
+    只保留 price >= 0 且 days >= 0 的档位；days=0 表示永久卡。
+    坏数据跳过而不是让整条发货链路报错。
     """
-    if fixed_usd and fixed_usd > 0:
-        return round(fixed_usd, 2)
-    rate = cny_per_usd if cny_per_usd > 0 else 1.0
-    value = (amount_cny / rate) * (multiplier if multiplier > 0 else 1.0)
-    return round(value, 2)
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+    if not isinstance(raw, list):
+        return []
+    tiers: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            price = float(item.get("price"))
+            days = int(float(item.get("days")))
+        except (TypeError, ValueError):
+            continue
+        if price < 0 or days < 0:
+            continue
+        tiers.append({
+            "sku_id": str(item.get("sku_id") or ""),
+            "label": str(item.get("label") or "规格"),
+            "price": round(price, 2),
+            "days": days,
+        })
+    return tiers
+
+
+def pick_price_tier(tiers: list[dict[str, Any]], amount_cny: float) -> dict[str, Any] | None:
+    """按订单实付金额匹配一个规格档位。
+
+    先找价格完全一致的（容忍 1 分钱误差）；没有就取价格最接近的一档，
+    但差距不能超过 max(1 元, 档位价 30%)，否则宁可不发也不猜。
+    闲鱼可能有优惠/改价，因此不能只认严格相等。
+    """
+    if not tiers or amount_cny is None or amount_cny <= 0:
+        return None
+    exact = [t for t in tiers if abs(float(t["price"]) - amount_cny) <= 0.011]
+    if exact:
+        return exact[0]
+    nearest = min(tiers, key=lambda t: abs(float(t["price"]) - amount_cny))
+    diff = abs(float(nearest["price"]) - amount_cny)
+    tolerance = max(1.0, float(nearest["price"]) * 0.3)
+    return nearest if diff <= tolerance else None
+
+
+def days_from_amount(amount_cny: float, days_per_cny: float = 1.0) -> int:
+    """订单金额（元）→ 2018K 卡密天数。
+
+    规则里的「每 1 元 = N 天」；四舍五入到整数天（half-up，不用银行家舍入，
+    否则 9.5 元会得到 10 但 10.5 元也只得到 10，看起来像少给一天）。
+    金额或倍率不是正数时返回 0，由调用方明确报错，不静默发一张 0 天卡。
+    """
+    if amount_cny is None or amount_cny <= 0:
+        return 0
+    rate = days_per_cny if days_per_cny and days_per_cny > 0 else 0.0
+    if rate <= 0:
+        return 0
+    return max(1, int(amount_cny * rate + 0.5))
 
 
 class DeliveryEngine:
@@ -134,6 +204,9 @@ class DeliveryEngine:
         if rule["mode"] == "upstream":
             return Decision("provision", reason="订单触发，命中上游规则 " + str(rule["name"]), rule=rule,
                             auto_confirm=bool(rule["auto_confirm"]))
+        if rule["mode"] == "minidaily":
+            return Decision("invite", reason="订单触发，命中 MiniDaily 二维码规则 " + str(rule["name"]),
+                            rule=rule, auto_confirm=bool(rule["auto_confirm"]))
 
         return await self._materialize(rule, msg)
 
@@ -175,6 +248,9 @@ class DeliveryEngine:
         if rule["mode"] == "upstream":
             # 上游模式要查订单金额，网络动作交给 runner，这里只判定「可以走了」
             return Decision("provision", reason="命中上游规则 " + str(rule["name"]), rule=rule,
+                            auto_confirm=bool(rule["auto_confirm"]))
+        if rule["mode"] == "minidaily":
+            return Decision("invite", reason="命中 MiniDaily 二维码规则 " + str(rule["name"]), rule=rule,
                             auto_confirm=bool(rule["auto_confirm"]))
 
         return await self._materialize(rule, msg)

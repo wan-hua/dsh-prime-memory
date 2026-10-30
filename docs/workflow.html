@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>闲鱼自动发货 · 工作流</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 46px 54px 38px;
+    background: #f3f6fb;
+    color: #172033;
+    font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+  }
+  .header { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 30px; }
+  .eyebrow { font-size: 13px; letter-spacing: 2px; color: #5073a7; font-weight: 700; }
+  h1 { margin: 8px 0 8px; font-size: 36px; letter-spacing: 1px; }
+  .subtitle { margin: 0; color: #66758e; font-size: 15px; }
+  .stamp { text-align: right; color: #7a879c; font-size: 12px; line-height: 1.8; }
+  .stamp b { color: #2f5f9f; font-size: 13px; }
+  .board { display: grid; grid-template-columns: 292px 1fr 292px; gap: 26px; align-items: start; }
+  .main { display: flex; flex-direction: column; }
+  .side { display: flex; flex-direction: column; gap: 18px; padding-top: 10px; }
+  .side-card { background: #fff; border: 1px solid #e1e8f2; border-radius: 14px; padding: 17px 18px; box-shadow: 0 5px 18px rgba(38, 61, 96, .05); }
+  .side-card h3 { margin: 0 0 10px; font-size: 15px; color: #24446f; }
+  .side-card p, .side-card li { font-size: 12.5px; line-height: 1.8; color: #5d6c82; }
+  .side-card ul { margin: 0; padding-left: 17px; }
+  .side-card li { margin: 3px 0; }
+  .stage {
+    position: relative; background: #fff; border: 1px solid #e2e9f3;
+    border-radius: 15px; padding: 18px 22px 18px 78px;
+    box-shadow: 0 6px 20px rgba(38, 61, 96, .055);
+    border-left: 5px solid var(--accent, #4b7fd0);
+  }
+  .stage .num {
+    position: absolute; left: 20px; top: 18px; width: 36px; height: 36px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 50%; background: var(--accent, #4b7fd0); color: #fff;
+    font-size: 15px; font-weight: 800;
+  }
+  .stage h2 { margin: 1px 0 5px; font-size: 18px; color: #1b2d48; }
+  .stage .hint { margin: 0 0 11px; font-size: 12.5px; color: #7a879b; }
+  .stage ul { margin: 0; padding-left: 18px; }
+  .stage li { margin: 4px 0; font-size: 13px; line-height: 1.7; color: #43526a; }
+  .stage li b { color: #1e3d65; }
+  .stage code { font-family: Consolas, "Courier New", monospace; background: #f1f5fb; color: #31557f; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .connector { height: 22px; display: flex; justify-content: center; }
+  .connector span { width: 2px; height: 100%; background: #b9cbe2; position: relative; }
+  .connector span::after { content: ""; position: absolute; left: -4px; bottom: -1px; border: 5px solid transparent; border-top-color: #8faac8; }
+  .branch { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+  .branch-card { background: #f8fbff; border: 1px solid #dbe7f4; border-radius: 10px; padding: 11px 13px; }
+  .branch-card h4 { margin: 0 0 5px; font-size: 13px; color: #2a507e; }
+  .branch-card p { margin: 0; font-size: 12px; line-height: 1.65; color: #63758c; }
+  .modes { display: grid; grid-template-columns: repeat(4, 1fr); gap: 9px; margin-top: 12px; }
+  .mode { background: #f8fbff; border: 1px solid #dbe7f4; border-radius: 9px; padding: 9px 10px; font-size: 11.5px; line-height: 1.5; color: #4a5f7b; }
+  .mode b { display: block; color: #24466e; font-size: 12px; margin-bottom: 2px; }
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+  .ok { background: #f0fbf6; border-color: #bce8d2 !important; }
+  .bad { background: #fff6f4; border-color: #f1c7c0 !important; }
+  .ok h4 { color: #1f7a51; } .bad h4 { color: #b3473d; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .pill { font-size: 11.5px; padding: 4px 9px; border-radius: 999px; background: #edf3fa; color: #405b7c; border: 1px solid #dbe6f2; }
+  .pill.green { background: #eaf8f0; color: #24764f; border-color: #c8ead8; }
+  .pill.red { background: #fff0ed; color: #a84135; border-color: #f2cec8; }
+  .pill.amber { background: #fff8e8; color: #8a641e; border-color: #f0dfb8; }
+  .pill.gray { background: #f1f4f8; color: #66768b; border-color: #e0e7ef; }
+  .footer { margin-top: 24px; display: flex; justify-content: space-between; color: #8a97a9; font-size: 11.5px; }
+  .accent-1 { --accent: #4d7fc9; } .accent-2 { --accent: #7b61c9; }
+  .accent-3 { --accent: #d18a32; } .accent-4 { --accent: #2f9a6c; }
+  .accent-5 { --accent: #3e8fa8; } .accent-6 { --accent: #c45b54; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div>
+      <div class="eyebrow">XIANYU AUTO REPLY · WORKFLOW</div>
+      <h1>闲鱼自动发货 · 端到端工作流</h1>
+      <p class="subtitle">从账号接入、消息分流，到建卡、确认发货、发送与异常回滚</p>
+    </div>
+    <div class="stamp"><b>当前实现</b><br />app/runner.py · app/engine.py<br />app/client.py · app/social.py</div>
+  </div>
+
+  <div class="board">
+    <aside class="side">
+      <div class="side-card">
+        <h3>入口与运行方式</h3>
+        <ul>
+          <li><code>start.sh</code> / systemd 启动 uvicorn</li>
+          <li>后台 FastAPI + SQLite</li>
+          <li>每个启用账号一个 AccountWorker</li>
+          <li>扫码登录或手工 Cookie</li>
+        </ul>
+      </div>
+      <div class="side-card">
+        <h3>两条收消息通道</h3>
+        <ul>
+          <li>WebSocket 推送：实时，但可能只有未读标记</li>
+          <li>会话列表轮询 + 历史补拉：保证正文到达</li>
+          <li>统一按 <code>messageId</code> 去重</li>
+        </ul>
+      </div>
+      <div class="side-card">
+        <h3>兜底与重试</h3>
+        <ul>
+          <li>断线按 5/10/30/60/120 秒退避</li>
+          <li>订单轮询 30 秒，收到推送提前唤醒</li>
+          <li>2018K 查单失败 10 秒后重试一次</li>
+          <li><code>DRY_RUN</code> 只打日志，不建资源</li>
+        </ul>
+      </div>
+    </aside>
+
+    <main class="main">
+      <section class="stage accent-1">
+        <div class="num">1</div>
+        <h2>启动 · 登录 · 账号接入</h2>
+        <p class="hint">先有账号，才有人替你听消息</p>
+        <ul>
+          <li><b>start.sh</b> 检查单实例 / 端口 / venv，交给 uvicorn；systemd 负责常驻。</li>
+          <li>FastAPI 打开后台，SQLite 初始化并加载面板保存的配置。</li>
+          <li>扫码登录写入 Cookie，<b>WorkerManager</b> 为每个启用账号启动 Worker。</li>
+          <li>Worker 建 WebSocket：心跳 → <code>/reg</code> → ackDiff，然后启动轮询任务。</li>
+        </ul>
+      </section>
+      <div class="connector"><span></span></div>
+
+      <section class="stage accent-2">
+        <div class="num">2</div>
+        <h2>配置 · 规则与自动化</h2>
+        <p class="hint">规则决定“这一单发什么”，开关决定“要不要自动做”</p>
+        <ul>
+          <li>发货规则按商品匹配：2018K / MiniDaily / 本地卡池 / 固定文案。</li>
+          <li>2018K 规则绑定实例，时长支持固定、SKU 档位、按金额换算，0 表示永久。</li>
+          <li>自动回复独立配置：商品回复 / 关键词回复，支持冷却与每会话一次。</li>
+          <li>订单自动化：领取小红花、求花、提醒收货、自动好评。</li>
+        </ul>
+      </section>
+      <div class="connector"><span></span></div>
+
+      <section class="stage accent-3">
+        <div class="num">3</div>
+        <h2>消息入口 · 解析与去重</h2>
+        <p class="hint">推送和拉取最终都汇到同一个处理入口</p>
+        <ul>
+          <li>WebSocket 推送进入收帧循环；会话轮询按固定间隔补齐正文。</li>
+          <li>解析 msgpack/base64 卡片，提取 <code>chat_id</code>、买家、商品、订单号。</li>
+          <li>先查 <code>seen_messages</code>，同一 <code>messageId</code> 只处理一次。</li>
+          <li>补买家真名 → 写 <code>messages</code> 流水 → 标记 chat / trade。</li>
+          <li><b>旧会话保护</b>：最后消息超过 1 天，整段忽略；只处理新消息。</li>
+        </ul>
+      </section>
+      <div class="connector"><span></span></div>
+
+      <section class="stage accent-4">
+        <div class="num">4</div>
+        <h2>分流 · 自动回复 / 社交 / 发货</h2>
+        <p class="hint">系统交易消息不回“在的”，真人消息才进入自动回复</p>
+        <div class="branch">
+          <div class="branch-card">
+            <h4>系统 / 交易消息</h4>
+            <p>关闭自动回复；按内容触发领取小红花、提醒收货、求花、好评。</p>
+          </div>
+          <div class="branch-card">
+            <h4>真人聊天</h4>
+            <p>商品 / 关键词规则匹配；冷却与每会话一次；付款文本还要核实订单。</p>
+          </div>
+        </div>
+        <ul style="margin-top:12px">
+          <li>付款卡片或核实过的付款文本进入发货决策；订单轮询同样进入。</li>
+          <li>已发货、冷却中、无规则、鉴权失败：跳过并记录原因。</li>
+        </ul>
+      </section>
+      <div class="connector"><span></span></div>
+
+      <section class="stage accent-5">
+        <div class="num">5</div>
+        <h2>发货决策 · 按规则准备内容</h2>
+        <p class="hint">先判断能不能发，再决定发什么</p>
+        <div class="modes">
+          <div class="mode"><b>2018K</b>查金额 → 算天数 → 建卡</div>
+          <div class="mode"><b>MiniDaily</b>生成一次性邀请链接</div>
+          <div class="mode"><b>本地卡池</b>按商品出库并锁定</div>
+          <div class="mode"><b>固定文案</b>变量渲染后直接发送</div>
+        </div>
+        <ul style="margin-top:12px">
+          <li>上游失败：<code>upstream_failed</code>；MiniDaily 失败：<code>invite_failed</code>。</li>
+          <li>本地卡池出库即锁定，发送失败会退回库存。</li>
+        </ul>
+      </section>
+      <div class="connector"><span></span></div>
+
+      <section class="stage accent-6">
+        <div class="num">6</div>
+        <h2>确认发货 → 发送卡密</h2>
+        <p class="hint">关键顺序：先确认，成功后才发送；失败绝不发卡</p>
+        <div class="split">
+          <div class="branch-card ok">
+            <h4>SUCCESS / 已发货</h4>
+            <p>调用 <code>confirm_shipping</code> 成功，或返回 <code>ORDER_ALREADY_DELIVERY</code>；发送卡密/文案，记 <code>delivered</code>。</p>
+          </div>
+          <div class="branch-card bad">
+            <h4>ORDER_STATUS_ERROR / 其他失败</h4>
+            <p>不发送；尝试撤销 2018K 卡密，记 <code>confirm_failed</code>；删卡失败则把卡密 ID 写进详情。</p>
+          </div>
+        </div>
+        <ul style="margin-top:12px">
+          <li>发送失败：<code>send_failed</code>，回滚卡密并记录；不会误标为已发货。</li>
+          <li>发送成功：<code>mark_delivered</code> + 写 outgoing 消息流水。</li>
+        </ul>
+      </section>
+      <div class="connector"><span></span></div>
+
+      <section class="stage accent-1">
+        <div class="num">7</div>
+        <h2>记录 · 面板 · 可观测</h2>
+        <p class="hint">所有结果都能在后台追溯</p>
+        <ul>
+          <li>订单状态：<code>delivered</code> / <code>confirm_failed</code> / <code>send_failed</code> / <code>upstream_failed</code> / <code>invite_failed</code>。</li>
+          <li>消息流水、发货记录、账号连接状态、规则与卡密池都在面板查看。</li>
+          <li>2018K 健康检查只在启动、保存配置、手动点击时执行，不做定时轮询。</li>
+        </ul>
+      </section>
+    </main>
+
+    <aside class="side">
+      <div class="side-card">
+        <h3>社交自动化（事件驱动）</h3>
+        <ul>
+          <li>买家送小红花 → 自动领取</li>
+          <li>已发货 → 提醒收货 + 求花</li>
+          <li>确认收货 → 求花 + 好评</li>
+          <li>按 <code>order_actions</code> 去重</li>
+          <li>提醒收货每日一次</li>
+        </ul>
+      </div>
+      <div class="side-card">
+        <h3>订单状态</h3>
+        <div class="legend">
+          <span class="pill green">delivered 已发货</span>
+          <span class="pill red">confirm_failed 确认失败</span>
+          <span class="pill red">send_failed 发送失败</span>
+          <span class="pill amber">upstream_failed 建卡失败</span>
+          <span class="pill amber">invite_failed 邀请失败</span>
+          <span class="pill gray">blocked 鉴权拦截</span>
+        </div>
+      </div>
+      <div class="side-card">
+        <h3>关键原则</h3>
+        <ul>
+          <li>系统交易消息不触发自动回复</li>
+          <li>旧会话超过 1 天不处理</li>
+          <li>先确认发货，再发送卡密</li>
+          <li>失败可回滚，状态终态化</li>
+          <li>推送 + 轮询双通道互补</li>
+        </ul>
+      </div>
+    </aside>
+  </div>
+
+  <div class="footer">
+    <span>依据当前仓库实现整理 · 适合运维 / 开发 / 交接阅读</span>
+    <span>2026-10-28 · xianyu-auto-reply</span>
+  </div>
+</body>
+</html>

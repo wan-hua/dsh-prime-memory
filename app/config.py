@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,8 +25,55 @@ def _load_dotenv(path: Path) -> None:
 _load_dotenv(BASE_DIR / ".env")
 
 
-#: new-api 新建令牌默认只放行的模型。改这里等于改所有没显式配置的部署。
-DEFAULT_MODEL_LIMITS = "deepseek-v4.1-flash"
+#: 2018K 卡密验证平台的默认地址（公开 API / 后台 API 是两套）
+DEFAULT_K2018_API_BASE = "https://api.2018k.cn/v3"
+DEFAULT_K2018_ADMIN_BASE = "https://admin.2018k.cn"
+
+_OPENID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
+@dataclass(slots=True, frozen=True)
+class K2018Instance:
+    """一个 2018K 实例：后台显示的名称 + 32 位 softwareId。"""
+
+    name: str
+    software_id: str
+
+    @property
+    def tail(self) -> str:
+        return self.software_id[-8:]
+
+
+def parse_k2018_instances(raw: str) -> list[K2018Instance]:
+    """解析 XY_2018K_INSTANCES。
+
+    支持三种写法，条目之间用逗号 / 分号 / 竖线 / 换行分隔：
+        Miracles=B4ADC92FDF7240398D8A80A4176C80BD
+        Miracles:B4ADC92FDF7240398D8A80A4176C80BD
+        B4ADC92FDF7240398D8A80A4176C80BD
+    没有名字时用「实例 + 后 8 位」自动命名；ID 不是 32 位十六进制的条目直接跳过，
+    不让一条写错的配置把整个进程带崩。
+    """
+    items: list[K2018Instance] = []
+    seen: set[str] = set()
+    for chunk in re.split(r"[,;|\n]+", raw or ""):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        name = ""
+        sid = chunk
+        for sep in ("=", ":"):
+            if sep in chunk:
+                name, sid = chunk.split(sep, 1)
+                name, sid = name.strip(), sid.strip()
+                break
+        if not _OPENID_RE.match(sid):
+            continue
+        if sid.upper() in seen:
+            continue
+        seen.add(sid.upper())
+        items.append(K2018Instance(name=name or ("实例" + sid[-8:]), software_id=sid.upper()))
+    return items
 
 
 def _float(name: str, default: float) -> float:
@@ -89,31 +137,50 @@ class Settings:
     send_retry: int = field(default_factory=lambda: _int("XY_SEND_RETRY", 2))
     dry_run: bool = field(default_factory=lambda: _bool("XY_DRY_RUN", False))
 
-    # 上游联动 new-api（按订单金额自动建 Key）
-    newapi_base_url: str = field(default_factory=lambda: os.getenv("XY_NEWAPI_BASE_URL", ""))
-    newapi_username: str = field(default_factory=lambda: os.getenv("XY_NEWAPI_USERNAME", ""))
-    newapi_password: str = field(default_factory=lambda: os.getenv("XY_NEWAPI_PASSWORD", ""))
-    newapi_session: str = field(default_factory=lambda: os.getenv("XY_NEWAPI_ACCESS_TOKEN", ""))
-    newapi_group: str = field(default_factory=lambda: os.getenv("XY_NEWAPI_GROUP", ""))
-    # 令牌名 = [前缀]买家用户名#订单号；默认不加前缀。想加就填，比如「闲鱼-」。
-    newapi_token_prefix: str = field(default_factory=lambda: os.getenv("XY_NEWAPI_TOKEN_PREFIX", ""))
-    # 新建令牌只允许使用的模型（逗号分隔）。默认只放行 deepseek-v4.1-flash，
-    # 避免买家拿 Key 去调别的贵模型；留空 = 不限制（老行为，慎用）。
-    newapi_model_limits: str = field(default_factory=lambda: os.getenv("XY_NEWAPI_MODEL_LIMITS", DEFAULT_MODEL_LIMITS))
-    # 多少元人民币换 1 美元额度。默认 1 = 订单 10 元发 10 美元额度（1:1，有意为之的让利）。
-    # 想按真实汇率收窄就设成 7.3 之类的数字。
-    cny_per_usd: float = field(default_factory=lambda: float(os.getenv("XY_CNY_PER_USD", "1") or 1))
-    # quota_per_unit 兜底值，正常会从 /api/status 读到真实值
-    newapi_quota_per_unit: float = field(default_factory=lambda: float(os.getenv("XY_NEWAPI_QUOTA_PER_UNIT", "0") or 0))
-    # new-api 0.13.x 必填：所有后台接口都要带 New-Api-User（用户 id）。留空会在登录后自动探测。
-    newapi_user_id: str = field(default_factory=lambda: os.getenv("XY_NEWAPI_USER_ID", ""))
+    # 上游联动 2018K 卡密验证平台（按订单金额换成天数卡密）
+    #: OpenId 同时是 AES 密钥；后台个人中心可见，32 位十六进制。
+    k2018_openid: str = field(default_factory=lambda: os.getenv("XY_2018K_OPENID", "").strip())
+    k2018_api_base: str = field(
+        default_factory=lambda: os.getenv("XY_2018K_API_BASE", DEFAULT_K2018_API_BASE)
+    )
+    #: 实例列表：Miracles=xxx,MiraclesX64=yyy；没有名字时自动用「实例+后8位」
+    k2018_instances: list[K2018Instance] = field(
+        default_factory=lambda: parse_k2018_instances(os.getenv("XY_2018K_INSTANCES", ""))
+    )
+    #: 可选：后台账号，用于发货失败时删除已建卡密。不配就只能人工删。
+    k2018_admin_base: str = field(
+        default_factory=lambda: os.getenv("XY_2018K_ADMIN_BASE", DEFAULT_K2018_ADMIN_BASE)
+    )
+    k2018_admin_username: str = field(
+        default_factory=lambda: os.getenv("XY_2018K_ADMIN_USERNAME", "").strip()
+    )
+    k2018_admin_password: str = field(
+        default_factory=lambda: os.getenv("XY_2018K_ADMIN_PASSWORD", "").strip()
+    )
 
-    # 上游联动 new-api-cost（把 Key 换成卡密）
-    cardshop_base_url: str = field(default_factory=lambda: os.getenv("XY_CARDSHOP_BASE_URL", "https://shop.lumorian.org"))
-    cardshop_admin_token: str = field(default_factory=lambda: os.getenv("XY_CARDSHOP_ADMIN_TOKEN", ""))
-    cardshop_username: str = field(default_factory=lambda: os.getenv("XY_CARDSHOP_USERNAME", ""))
-    cardshop_password: str = field(default_factory=lambda: os.getenv("XY_CARDSHOP_PASSWORD", ""))
-    cardshop_groups: int = field(default_factory=lambda: _int("XY_CARDSHOP_GROUPS", 5))
+    # MiniDailyReward 扫码入池（同一台服务器上的控制台）
+    #: 只监听本机即可，例如 http://127.0.0.1:8790
+    minidaily_api_base: str = field(
+        default_factory=lambda: os.getenv("XY_MINIDAILY_API_BASE", "http://127.0.0.1:8790").rstrip("/")
+    )
+    #: MiniDailyReward 控制台令牌；只在本机 .env 保存，不回显
+    minidaily_token: str = field(
+        default_factory=lambda: os.getenv("XY_MINIDAILY_TOKEN", "").strip()
+    )
+
+    # 订单社交自动化：求小红花 / 提醒收货 / 自动评价
+    social_auto_flower: bool = field(default_factory=lambda: _bool("XY_SOCIAL_AUTO_FLOWER", False))
+    social_auto_remind: bool = field(default_factory=lambda: _bool("XY_SOCIAL_AUTO_REMIND", False))
+    social_auto_rate: bool = field(default_factory=lambda: _bool("XY_SOCIAL_AUTO_RATE", False))
+    #: 买家送小红花时自动领取；这件事通常是正向互动，默认开启。
+    social_auto_receive_flower: bool = field(
+        default_factory=lambda: _bool("XY_SOCIAL_AUTO_RECEIVE_FLOWER", True)
+    )
+    social_rate_content: str = field(
+        default_factory=lambda: os.getenv("XY_SOCIAL_RATE_CONTENT", "很好，合作愉快！").strip()
+    )
+    #: 开启自动化时写入；只处理这个时间之后创建的订单，避免一开就把历史订单全部打扰一遍。
+    social_since: str = field(default_factory=lambda: os.getenv("XY_SOCIAL_SINCE", "").strip())
 
     # WebSocket 心跳间隔（秒）。对齐网页端：首跳立即发，之后每 10 秒一次。
     heartbeat_interval: float = field(default_factory=lambda: _float("XY_HEARTBEAT_INTERVAL", 10.0))
@@ -136,6 +203,11 @@ class Settings:
     # 每轮最多给几个会话补拉历史（每次是一趟 WS 往返）。0 = 永远只看最后一条。
     message_history_conversations: int = field(
         default_factory=lambda: _int("XY_MESSAGE_HISTORY_CONVERSATIONS", 5)
+    )
+    # 旧会话保护：会话最后一条消息距现在超过这么多秒，整段历史都不处理。
+    # 0 = 关闭保护（不推荐）；默认 1 天。
+    message_stale_seconds: int = field(
+        default_factory=lambda: _int("XY_MESSAGE_STALE_SECONDS", 86400)
     )
 
     # 自动回复总开关。关掉后商品 / 关键词自动回复全部不生效（只发货）。
@@ -183,54 +255,69 @@ class Settings:
 
 
 
-#: 后台「设置」页可覆盖的配置项 → app_config 表里的 key。
-#: 这些项在 .env 里仍然是默认值，但 web 后台保存过就以数据库为准。
-MODEL_LIMITS_KEY = "newapi_model_limits"
+def k2018_ready() -> bool:
+    """2018K 是否配置齐全：OpenId + 至少一个实例。
 
-
-def resolved_model_limits(overrides: dict[str, str] | None = None) -> str:
-    """新建 Key 实际使用的模型白名单。
-
-    优先级：后台「设置」页保存的值 > XY_NEWAPI_MODEL_LIMITS > DEFAULT_MODEL_LIMITS。
-    留空 = 不限制模型（会打警告，等于主动关掉这层保护）。
-
-    overrides 传入 app_config 的整张表；不传时直接读数据库（读不到就退回环境变量），
-    这样没有 DB 会话的脚本也能用同一个口径。
+    后台账号不是发货必需项，只影响「发货失败时能不能自动删卡」。
     """
-    if overrides is None:
-        overrides = _config_overrides_from_db()
-    if MODEL_LIMITS_KEY in overrides:
-        return overrides[MODEL_LIMITS_KEY]
-    return settings.newapi_model_limits
+    return bool(_OPENID_RE.match(settings.k2018_openid)) and bool(settings.k2018_instances)
 
 
-def _config_overrides_from_db() -> dict[str, str]:
-    """同步读一次 app_config。仅在没有现成 dict 时兜底用（异步环境请传 overrides）。"""
-    import sqlite3
-
-    try:
-        if not settings.db_path.exists():
-            return {}
-        conn = sqlite3.connect(settings.db_path)
-        try:
-            rows = conn.execute("SELECT key, value FROM app_config").fetchall()
-        finally:
-            conn.close()
-        return {str(k): str(v) for k, v in rows}
-    except sqlite3.Error:
-        # 读不到配置不该让发货链路炸掉，退回环境变量
-        return {}
+def k2018_admin_ready() -> bool:
+    """是否配置了 2018K 后台账号，可用于删除未送达的卡密。"""
+    return bool(settings.k2018_admin_username and settings.k2018_admin_password)
 
 
-def upstream_ready() -> bool:
-    """new-api 与卡密站是否都配置齐全（缺一个都不能走自动建 Key）。"""
-    newapi = bool(settings.newapi_base_url) and bool(
-        settings.newapi_session or (settings.newapi_username and settings.newapi_password)
-    )
-    cardshop = bool(settings.cardshop_base_url) and bool(
-        settings.cardshop_admin_token or (settings.cardshop_username and settings.cardshop_password)
-    )
-    return newapi and cardshop
+def find_k2018_instance(software_id: str) -> K2018Instance | None:
+    """按 softwareId 找配置里的实例（大小写不敏感）。"""
+    target = (software_id or "").strip().upper()
+    for item in settings.k2018_instances:
+        if item.software_id.upper() == target:
+            return item
+    return None
 
 
 settings = Settings()
+
+
+def apply_saved_k2018_config(values: dict[str, str]) -> None:
+    """把后台保存的 2018K 配置覆盖到当前 settings。
+
+    数据库里没有的 key 保持 .env 的值；这样老部署仍然能用 .env，
+    面板保存过之后以面板为准（包括把后台账号清空这种显式操作）。
+    """
+    if "k2018_openid" in values:
+        settings.k2018_openid = str(values["k2018_openid"] or "").strip()
+    if "k2018_instances" in values:
+        settings.k2018_instances = parse_k2018_instances(str(values["k2018_instances"] or ""))
+    if "k2018_admin_username" in values:
+        settings.k2018_admin_username = str(values["k2018_admin_username"] or "").strip()
+    if "k2018_admin_password" in values:
+        settings.k2018_admin_password = str(values["k2018_admin_password"] or "")
+
+
+def social_any_enabled() -> bool:
+    """是否有任一订单社交自动化开关打开。"""
+    return bool(
+        settings.social_auto_flower
+        or settings.social_auto_remind
+        or settings.social_auto_rate
+        or settings.social_auto_receive_flower
+    )
+
+
+def apply_saved_social_config(values: dict[str, str]) -> None:
+    """把面板保存的订单社交开关覆盖到当前 settings。"""
+    truthy = {"1", "true", "yes", "on"}
+    for key, attr in (
+        ("social_auto_flower", "social_auto_flower"),
+        ("social_auto_remind", "social_auto_remind"),
+        ("social_auto_rate", "social_auto_rate"),
+        ("social_auto_receive_flower", "social_auto_receive_flower"),
+    ):
+        if key in values:
+            setattr(settings, attr, str(values[key]).strip().lower() in truthy)
+    if "social_rate_content" in values:
+        settings.social_rate_content = str(values["social_rate_content"] or "").strip()
+    if "social_since" in values:
+        settings.social_since = str(values["social_since"] or "").strip()

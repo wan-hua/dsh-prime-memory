@@ -151,6 +151,7 @@ td.actions{text-align:right;white-space:nowrap}
   border:1px solid var(--line);background:var(--panel);color:var(--fg);font:inherit;font-size:13px}
 textarea.in{height:auto;padding:10px 11px;resize:vertical;line-height:1.6}
 .in::placeholder{color:var(--muted);opacity:.75}
+.in:disabled{opacity:.45;background:var(--hover);cursor:not-allowed}
 .in:focus,select.in:focus,textarea.in:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-glow)}
 select.in{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),
   linear-gradient(135deg,var(--muted) 50%,transparent 50%);
@@ -285,7 +286,8 @@ select.in{appearance:none;background-image:linear-gradient(45deg,transparent 50%
       </a>
     </nav>
     <div class="side-foot">
-      <div class="side-row" id="side-upstream"><span class="dot"></span><span>上游检测中…</span></div>
+      <div class="side-row" id="side-accounts"><span class="dot"></span><span>闲鱼检测中…</span></div>
+      <div class="side-row" id="side-upstream"><span class="dot"></span><span>2018K 未检测</span></div>
       <div class="side-row" id="side-mode"><span class="dot ok"></span><span>正式发货</span></div>
     </div>
   </aside>
@@ -402,7 +404,7 @@ select.in{appearance:none;background-image:linear-gradient(45deg,transparent 50%
             </button>
           </div>
           <div class="card-b tight tw"><table>
-            <thead><tr><th>规则</th><th>商品</th><th>模式</th><th>额度策略</th><th>自动确认</th><th>状态</th><th></th></tr></thead>
+            <thead><tr><th>规则</th><th>商品</th><th>模式</th><th>实例 / 卡密时长</th><th>自动确认</th><th>状态</th><th></th></tr></thead>
             <tbody id="rules"></tbody>
           </table></div>
         </div>
@@ -451,34 +453,71 @@ select.in{appearance:none;background-image:linear-gradient(45deg,transparent 50%
 
         <div class="card">
           <div class="card-h">
-            <div><h2>Key 模型限制</h2>
-              <p class="sub">每卖出一单都会新建一个 Key —— 这里决定这些 Key 能调哪些模型</p></div>
+            <div><h2>2018K 接入配置</h2>
+              <p class="sub">首次使用填 OpenId；实例可以在这里增删；后台账号密码选填（只影响失败删卡）</p></div>
           </div>
           <div class="card-b">
-            <div class="field">
-              <span class="lbl">允许的模型（逗号 / 空格 / 换行分隔）</span>
-              <textarea class="in" id="set-model-limits" rows="3"
-                placeholder="deepseek-v4.1-flash, deepseek-v4.1"
-                oninput="updateModelLimitsPreview()"></textarea>
-              <span class="hint">留空 = 不限制（买家可以拿 Key 调任意模型，慎用）。
-                支持中文逗号，保存时自动去空格、去重。</span>
+            <div class="form-grid">
+              <label class="field"><span class="lbl">OpenId</span>
+                <input class="in" id="k2018-openid" type="password" autocomplete="new-password" placeholder="32 位十六进制 OpenId" /></label>
+              <label class="field"><span class="lbl">后台账号（选填）</span>
+                <input class="in" id="k2018-admin-user" autocomplete="username" placeholder="用于自动删卡，可留空" /></label>
+              <label class="field"><span class="lbl">后台密码（选填）</span>
+                <input class="in" id="k2018-admin-pass" type="password" autocomplete="new-password" placeholder="可留空" /></label>
             </div>
+            <p class="tiny muted" style="margin:-4px 0 14px;line-height:1.8">
+              OpenId 是 AES 密钥（不是登录凭据），<b>不要</b>填到发货规则里。已配置时输入框留空表示不修改；
+              后台账号密码也留空表示保持原值。
+            </p>
 
-            <div class="field" style="margin-top:4px">
-              <span class="lbl">保存后新 Key 会变成这样</span>
-              <pre class="preview" id="set-model-limits-preview"></pre>
+            <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:8px">
+              <span class="lbl">2018K 实例</span>
+              <button class="btn" onclick="addK2018Instance()">+ 添加实例</button>
             </div>
+            <div id="k2018-instances"></div>
 
-            <div class="row" style="margin-top:16px;gap:10px;align-items:center">
-              <button class="btn primary" onclick="saveSettings()">保存设置</button>
-              <button class="btn" onclick="resetModelLimits()">恢复默认值</button>
-              <span class="tiny muted" id="set-model-limits-source"></span>
+            <label class="check" style="margin-top:4px"><input type="checkbox" id="k2018-clear-admin" />
+              清空后台账号（发货失败时不再自动删卡）</label>
+
+            <div class="row" style="align-items:center;margin-top:12px">
+              <button class="btn primary" id="k2018-save" onclick="saveK2018()">保存接入配置</button>
+              <button class="btn" id="k2018-check" onclick="checkK2018Health()">重新检测</button>
+              <span class="tiny muted" id="k2018-save-status"></span>
             </div>
-
+            <div id="k2018-status" style="margin-top:14px"></div>
             <p class="tiny muted" style="margin:14px 0 0;line-height:1.8">
-              · 保存后立即对新订单生效，<b>不用重启、也不用改 .env</b>。<br />
-              · 只影响<b>之后新建</b>的 Key；已经发出去的旧 Key 要去 new-api 后台逐个改。<br />
-              · 这里存的是运营参数；账号、密码这类凭据仍然只从 .env 读取。
+              · 保存后立即生效，不需要重启服务；面板保存的值优先于 <code>.env</code>。<br />
+              · 没有面板配置时，仍会读取 <code>XY_2018K_OPENID</code> / <code>XY_2018K_INSTANCES</code> 作为初始值。
+            </p>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-h">
+            <div><h2>订单自动化</h2>
+              <p class="sub">领取小红花 / 求小红花 / 提醒收货 / 自动评价；默认关闭，只处理开启后创建的新订单</p></div>
+          </div>
+          <div class="card-b">
+            <label class="check"><input type="checkbox" id="social-auto-receive-flower" />
+              自动领取买家送来的小红花（默认开启）</label>
+            <label class="check"><input type="checkbox" id="social-auto-flower" />
+              自动向「已发货 / 交易成功」订单的买家求小红花</label>
+            <label class="check"><input type="checkbox" id="social-auto-remind" />
+              自动提醒「已发货 / 等待见面交易」订单的买家确认收货（每日最多一次）</label>
+            <label class="check"><input type="checkbox" id="social-auto-rate" />
+              买家确认收货后自动给好评</label>
+            <label class="field" style="margin-top:10px"><span class="lbl">好评内容</span>
+              <textarea class="in" id="social-rate-content" rows="3" maxlength="200"
+                placeholder="例如：很好，合作愉快！"></textarea></label>
+            <div class="row" style="align-items:center;margin-top:10px">
+              <button class="btn primary" id="social-save" onclick="saveSocial()">保存订单自动化</button>
+              <span class="tiny muted" id="social-save-status"></span>
+            </div>
+            <p class="tiny muted" style="margin:12px 0 0;line-height:1.8">
+              · 开启时刻作为起点，不会回溯处理历史订单，避免一次性打扰大量买家。<br />
+              · 买家送小红花时自动领取，不需要手动点「立即收下」。<br />
+              · 提醒收货遇到「今日已提醒过，请勿重复提醒」会记为今日已完成，不会再重复发送。<br />
+              · 评价使用 5 星好评；评价内容为空时不会自动评价。
             </p>
           </div>
         </div>
@@ -490,17 +529,19 @@ select.in{appearance:none;background-image:linear-gradient(45deg,transparent 50%
           <div class="card-h">
             <div><h2>发货记录</h2><p class="sub" id="orders-count">—</p></div>
             <div class="row" style="flex:0 0 auto;gap:8px">
-              <input class="in" id="orders-q" placeholder="搜订单号 / 买家 / 商品" style="width:230px" oninput="renderOrders()" />
+              <input class="in" id="orders-q" placeholder="搜订单号 / 买家 / 商品 / 卡密ID" style="width:250px" oninput="renderOrders()" />
               <select class="in" id="orders-status" style="width:128px" onchange="renderOrders()">
                 <option value="">全部状态</option>
                 <option value="delivered">已发货</option>
                 <option value="send_failed">发送失败</option>
-                <option value="upstream_failed">上游失败</option>
+                <option value="confirm_failed">确认发货失败（未发卡）</option>
+                <option value="upstream_failed">2018K 建卡失败</option>
+                <option value="invite_failed">二维码生成失败</option>
               </select>
             </div>
           </div>
           <div class="card-b tight tw"><table>
-            <thead><tr><th>时间</th><th>订单号</th><th>买家</th><th>金额</th><th>额度</th><th>状态</th><th>详情</th></tr></thead>
+            <thead><tr><th>时间</th><th>订单号</th><th>买家</th><th>金额</th><th>天数</th><th>卡密ID</th><th>状态</th><th>详情</th></tr></thead>
             <tbody id="orders"></tbody>
           </table></div>
         </div>
@@ -538,13 +579,27 @@ select.in{appearance:none;background-image:linear-gradient(45deg,transparent 50%
 
       <!-- ============ 消息 ============ -->
       <section class="view" id="view-messages">
-        <div class="card">
+        <div class="card" style="margin-bottom:16px">
           <div class="card-h">
-            <div><h2>消息流水</h2><p class="sub" id="msgs-count">—</p></div>
-            <input class="in" id="msgs-q" placeholder="搜买家 / 内容" style="width:230px" oninput="renderMessages()" />
+            <div><h2>按用户聚合</h2>
+              <p class="sub">同一个买家的收到 / 发出 / 聊天 / 交易通知统计</p></div>
           </div>
           <div class="card-b tight tw"><table>
-            <thead><tr><th>时间</th><th>方向</th><th>对方</th><th>内容</th></tr></thead>
+            <thead><tr><th>用户</th><th>收到</th><th>发出</th><th>聊天</th><th>交易</th><th>合计</th><th>最近时间</th><th>最近消息</th></tr></thead>
+            <tbody id="messages-summary"></tbody>
+          </table></div>
+        </div>
+
+        <div class="card">
+          <div class="card-h">
+            <div><h2>消息明细</h2><p class="sub" id="msgs-count">—</p></div>
+            <div class="row" style="flex:0 0 auto;gap:8px">
+              <input class="in" id="msgs-q" placeholder="搜买家 / 内容" style="width:230px" oninput="renderMessages()" />
+              <button class="btn" style="color:var(--err)" onclick="clearMessages()">清空消息</button>
+            </div>
+          </div>
+          <div class="card-b tight tw"><table>
+            <thead><tr><th>时间</th><th>方向</th><th>类型</th><th>对方</th><th>内容</th></tr></thead>
             <tbody id="messages"></tbody>
           </table></div>
         </div>
@@ -569,7 +624,8 @@ select.in{appearance:none;background-image:linear-gradient(45deg,transparent 50%
           <input class="in" id="rule-name" placeholder="例如：会员月卡" /></label>
         <label class="field"><span class="lbl">发货模式</span>
           <select class="in" id="rule-mode" onchange="onRuleMeta()">
-            <option value="upstream">按订单金额建 Key（推荐）</option>
+            <option value="upstream">2018K 卡密（推荐）</option>
+            <option value="minidaily">MiniDaily 二维码（扫码入池）</option>
             <option value="card">本地卡密池</option>
             <option value="text">固定文案</option>
           </select></label>
@@ -588,17 +644,43 @@ select.in{appearance:none;background-image:linear-gradient(45deg,transparent 50%
           <input class="in" id="rule-priority" type="number" placeholder="0" value="0" /></label>
       </div>
       <div class="form-grid" id="rule-upstream-fields">
-        <label class="field"><span class="lbl">金额倍率</span>
-          <input class="in" id="rule-mult" type="number" step="0.01" value="1" oninput="onRuleMeta()" /></label>
-        <label class="field"><span class="lbl">固定额度 USD（0 = 按订单金额）</span>
-          <input class="in" id="rule-fixed" type="number" step="0.01" value="0" oninput="onRuleMeta()" /></label>
+        <label class="field" id="rule-instance-field"><span class="lbl">2018K 实例</span>
+          <select class="in" id="rule-instance" onchange="onRuleMeta()">
+            <option value="">— 先在 .env 配置实例 —</option>
+          </select></label>
+        <label class="field" id="rule-duration-mode-field"><span class="lbl">卡密/二维码时长计算方式</span>
+          <select class="in" id="rule-duration-mode" onchange="onRuleMeta()">
+            <option value="fixed">按本商品固定天数</option>
+            <option value="tiers">按商品规格（天卡/周卡/月卡）</option>
+            <option value="per_amount">按订单金额换算（多档价格）</option>
+          </select></label>
+      </div>
+      <div class="form-grid" id="rule-duration-fields">
+        <label class="field"><span class="lbl">本商品固定天数（0 = 永久）</span>
+          <input class="in" id="rule-fixed-days" type="number" min="0" step="1" value="1" oninput="onRuleMeta()" /></label>
+        <label class="field"><span class="lbl">每 1 元 = 多少天</span>
+          <input class="in" id="rule-days-per-cny" type="number" min="0.01" step="0.01" value="1" oninput="onRuleMeta()" /></label>
       </div>
       <p class="tiny muted" id="quota-note" style="margin:-6px 0 0"></p>
+      <div id="rule-tier-fields" style="display:none;margin-top:10px">
+        <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:7px">
+          <span class="lbl">商品规格与卡密天数</span>
+          <button class="btn" onclick="loadSkus()">拉取规格</button>
+        </div>
+        <div class="tw"><table>
+          <thead><tr><th>规格</th><th>价格</th><th>卡密天数</th></tr></thead>
+          <tbody id="rule-tiers"></tbody>
+        </table></div>
+        <p class="tiny muted" style="margin-top:7px" id="rule-tier-note">
+          点「拉取规格」获取天卡/周卡/月卡的售价，再给每一档填卡密天数；某档填 0 表示永久卡。
+        </p>
+      </div>
+      <p class="tiny muted" style="margin:4px 0 0">每个商品建议单独建一条规则；固定天数只按这个商品设置，多规格商品用「按商品规格」逐档设置。</p>
       <label class="check"><input type="checkbox" id="rule-confirm" checked />
         发完自动点「无需物流发货」</label>
       <label class="field"><span class="lbl">发货文案</span>
         <textarea class="in" id="rule-content" rows="5" oninput="updatePreview()"
-          placeholder="可用变量：{card} 卡密 / {buyer} 买家 / {amount} 订单金额 / {quota} 额度 / {item_id} / {order_id} / {date}"></textarea>
+          placeholder="可用变量：{card} 卡密或二维码链接 / {qr_url} 二维码链接 / {buyer} 买家 / {amount} 订单金额 / {days} 天数 / {item_id} / {order_id} / {date}"></textarea>
       </label>
       <div class="field">
         <span class="lbl">买家会收到这样的消息</span>
@@ -681,7 +763,12 @@ select.in{appearance:none;background-image:linear-gradient(45deg,transparent 50%
 <script>
 var TOKEN = new URLSearchParams(location.search).get("token") || "";
 var S = { accounts: [], status: [], rules: [], replyRules: [], cards: [], stock: [], orders: [], messages: [], cfg: null };
-var QR_TIMER = null, QR_SID = null, ITEM_PRICES = {}, EDIT_ID = null, TICK = 0;
+var SOCIAL_FORM_LOADED = false;
+var DEFAULT_CARD_CONTENT = "你好 {buyer}，这是你的卡密：\n\n{card}\n\n有效期 {days} 天，如有问题直接回复本消息。";
+var DEFAULT_QR_CONTENT = "你好 {buyer}，这是你的 MiniDailyReward 入池链接：\n\n{qr_url}\n\n挂载天数：{days} 天\n链接 10 分钟内有效，请尽快打开并按页面提示填写迷你号/密码。";
+var QR_TIMER = null, QR_SID = null, ITEM_PRICES = {}, ITEM_INFO = {}, EDIT_ID = null, TICK = 0;
+var RULE_TIERS = [], RULE_TIER_ITEM = "";
+var K2018_FORM_LOADED = false;
 var REPLY_EDIT_ID = null;
 
 var VIEWS = ["overview", "accounts", "rules", "replies", "orders", "cards", "messages", "settings"];
@@ -693,7 +780,7 @@ var TITLES = {
   orders: ["发货记录", "每一单的结果都在这里"],
   cards: ["卡密池", "本地卡密的进口与出库"],
   messages: ["消息流水", "收到和发出的每一条私信"],
-  settings: ["设置", "Key 能调哪些模型，在这里改"]
+  settings: ["设置", "2018K 实例与接入状态"]
 };
 
 /* ---------- 基础工具 ---------- */
@@ -743,7 +830,6 @@ function esc(s) {
 function pad(n) { return n < 10 ? "0" + n : "" + n; }
 function nfmt(n) { return Number(n || 0).toLocaleString("zh-CN"); }
 function yuan(n) { return n == null ? "—" : "¥" + Number(n).toFixed(2); }
-function usd(n) { return n == null ? "—" : "$" + Number(n).toFixed(2); }
 function relTime(s) {
   if (!s) return "—";
   var d = new Date(String(s).replace(" ", "T")).getTime();
@@ -754,6 +840,17 @@ function relTime(s) {
   if (diff < 86400) return Math.floor(diff / 3600) + " 小时前";
   if (diff < 86400 * 7) return Math.floor(diff / 86400) + " 天前";
   return esc(s);
+}
+function exactTime(s) {
+  // 消息流水要能对时间，不要「1 小时前」这种大概值
+  if (!s) return "—";
+  return esc(String(s).replace("T", " ").slice(0, 19));
+}
+function epochTime(sec) {
+  if (!sec) return "—";
+  var d = new Date(Number(sec) * 1000);
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
+    " " + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
 }
 function emptyRow(cols, text, icon) {
   return "<tr><td colspan='" + cols + "'><div class='empty'><div class='ic'>" + (icon || "○") + "</div><div>" + esc(text) + "</div></div></td></tr>";
@@ -779,22 +876,45 @@ function applyView() {
 window.addEventListener("hashchange", applyView);
 
 /* ---------- 扫码登录 ---------- */
+async function loadQrImage(sid) {
+  // <img src> 不会带 X-Admin-Token；服务器不在本机时会被鉴权拦成 401。
+  // 所以用 fetch 带头取 PNG，再转成 blob URL 给 img。
+  var img = document.getElementById("qr-img");
+  var res = await fetch("/api/login/" + sid + "/qrcode?t=" + Date.now(), {
+    headers: TOKEN ? { "X-Admin-Token": TOKEN } : {},
+    cache: "no-store"
+  });
+  if (!res.ok) throw new Error(await explainError(res));
+  var blob = await res.blob();
+  if (img.dataset.blob) URL.revokeObjectURL(img.dataset.blob);
+  var url = URL.createObjectURL(blob);
+  img.dataset.blob = url;
+  img.alt = "登录二维码";
+  img.src = url;
+}
 async function startQr() {
   var name = document.getElementById("login-name").value.trim() || "闲鱼账号";
   try {
     var r = await api("/api/login/start", { method: "POST", body: JSON.stringify({ name: name, remark: "" }) });
     QR_SID = r.session_id;
     document.getElementById("qr-area").style.display = "flex";
-    document.getElementById("qr-img").src = "/api/login/" + r.session_id + "/qrcode?t=" + Date.now();
     document.getElementById("qr-title").textContent = "等待扫码";
     document.getElementById("qr-status").className = "muted";
+    document.getElementById("qr-status").textContent = "正在加载二维码…";
+    await loadQrImage(r.session_id);
     document.getElementById("qr-status").textContent = "用手机闲鱼 App 扫左边的二维码";
     if (QR_TIMER) clearInterval(QR_TIMER);
     QR_TIMER = setInterval(function () { pollQr(r.session_id); }, 2000);
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    document.getElementById("qr-status").textContent = "二维码加载失败：" + e.message;
+    toast("二维码加载失败：" + e.message, true);
+  }
 }
 function cancelQr() {
   if (QR_TIMER) { clearInterval(QR_TIMER); QR_TIMER = null; }
+  var img = document.getElementById("qr-img");
+  if (img.dataset.blob) { URL.revokeObjectURL(img.dataset.blob); delete img.dataset.blob; }
+  img.removeAttribute("src");
   document.getElementById("qr-area").style.display = "none";
 }
 async function pollQr(sid) {
@@ -842,7 +962,9 @@ async function fetchItems() {
   try {
     var items = await api("/api/accounts/" + S.accounts[0].id + "/items");
     ITEM_PRICES = {};
+    ITEM_INFO = {};
     for (var i = 0; i < items.length; i++) {
+      ITEM_INFO[items[i].item_id] = items[i];
       var num = parseFloat(String(items[i].price).replace(/[^0-9.]/g, ""));
       if (isFinite(num) && num > 0) ITEM_PRICES[items[i].item_id] = num;
     }
@@ -853,7 +975,8 @@ async function fetchItems() {
 function fillItemPick(selectId, inputId, items) {
   var sel = document.getElementById(selectId);
   sel.innerHTML = '<option value="">— 从我的在售商品里选 —</option>' + items.map(function (it) {
-    return '<option value="' + esc(it.item_id) + '">' + esc(it.title) + " (¥" + esc(it.price) + ")</option>";
+    var skuTag = it.is_sku ? "（多规格）" : "";
+    return '<option value="' + esc(it.item_id) + '">' + esc(it.title) + skuTag + " (¥" + esc(it.price) + ")</option>";
   }).join("");
   sel.onchange = function () { if (this.value) document.getElementById(inputId).value = this.value; };
 }
@@ -868,31 +991,140 @@ async function loadItems() {
   document.getElementById("rule-item-pick").onchange = function () { pickItem(this.value); };
   onRuleMeta();
 }
-function pickItem(v) { if (v) { document.getElementById("rule-item").value = v; onRuleMeta(); } }
+function pickItem(v) {
+  if (v) {
+    document.getElementById("rule-item").value = v;
+    if (v !== RULE_TIER_ITEM) {
+      RULE_TIERS = [];
+      RULE_TIER_ITEM = "";
+      renderTiers([]);
+    }
+    onRuleMeta();
+  }
+}
+
+/* ---------- 商品规格（天卡/周卡/月卡） ---------- */
+function parseTiers(raw) {
+  if (Array.isArray(raw)) return raw;
+  try { return JSON.parse(raw || "[]"); } catch (e) { return []; }
+}
+function defaultDaysForLabel(label) {
+  var text = String(label || "");
+  if (text.indexOf("年") >= 0) return 365;
+  if (text.indexOf("月") >= 0) return 30;
+  if (text.indexOf("周") >= 0) return 7;
+  if (text.indexOf("天") >= 0) return 1;
+  return 1;
+}
+function renderTiers(tiers) {
+  var body = document.getElementById("rule-tiers");
+  if (!body) return;
+  if (!tiers || !tiers.length) {
+    body.innerHTML = "<tr><td colspan='3' class='muted tiny'>还没有规格，点右上角「拉取规格」。</td></tr>";
+    return;
+  }
+  body.innerHTML = tiers.map(function (t) {
+    return "<tr data-sku='" + esc(t.sku_id || "") + "' data-label='" + esc(t.label || "规格") +
+      "' data-price='" + esc(t.price) + "'><td><b>" + esc(t.label || "规格") + "</b></td>" +
+      "<td class='num'>¥" + esc(t.price) + "</td>" +
+      "<td><input class='in tier-days' type='number' min='0' step='1' value='" +
+      esc(t.days) + "' oninput='updateQuotaNote();updatePreview()' /></td></tr>";
+  }).join("");
+}
+function collectTiers() {
+  var rows = document.querySelectorAll("#rule-tiers tr");
+  var out = [];
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    if (!row.getAttribute("data-sku")) continue;
+    var input = row.querySelector(".tier-days");
+    out.push({
+      sku_id: row.getAttribute("data-sku") || "",
+      label: row.getAttribute("data-label") || "规格",
+      price: Number(row.getAttribute("data-price") || 0),
+      days: Number(input ? input.value : 0)
+    });
+  }
+  return out;
+}
+async function loadSkus() {
+  var itemId = (document.getElementById("rule-item").value || "").trim();
+  if (!itemId || itemId === "*") { toast("先在「商品 ID」里选一个具体商品", true); return; }
+  if (!S.accounts.length) { toast("先登录一个闲鱼账号", true); return; }
+  try {
+    var data = await api("/api/accounts/" + S.accounts[0].id + "/items/" + encodeURIComponent(itemId) + "/skus");
+    var skus = data.skus || [];
+    if (!skus.length) {
+      document.getElementById("rule-tier-note").textContent =
+        "这个商品没有返回规格（可能是单规格商品，或详情接口没给 skuList）。";
+      toast("没有拉到规格，可改用固定天数", true);
+      return;
+    }
+    var old = collectTiers();
+    RULE_TIERS = skus.map(function (s) {
+      var prev = null;
+      for (var i = 0; i < old.length; i++) if (old[i].sku_id === s.sku_id) prev = old[i];
+      return {
+        sku_id: s.sku_id, label: s.label, price: s.price,
+        days: prev && prev.days > 0 ? prev.days : defaultDaysForLabel(s.label)
+      };
+    });
+    RULE_TIER_ITEM = itemId;
+    renderTiers(RULE_TIERS);
+    document.getElementById("rule-tier-note").textContent =
+      "已拉取 " + RULE_TIERS.length + " 个规格；按订单实付金额匹配对应档位。";
+    updateQuotaNote();
+    updatePreview();
+  } catch (e) { toast(e.message, true); }
+}
 
 /* ---------- 规则弹窗 ---------- */
+function fillInstancePick() {
+  var sel = document.getElementById("rule-instance");
+  if (!sel) return;
+  var instances = (S.cfg && S.cfg.k2018 && S.cfg.k2018.instances) || [];
+  var current = sel.value;
+  sel.innerHTML = "<option value=''>— 请选择实例 —</option>" + (instances.length ? instances.map(function (it) {
+    return "<option value='" + esc(it.software_id) + "'>" + esc(it.name) + "（…" + esc(it.tail) + "）</option>";
+  }).join("") : "<option value='' disabled>— 先在 .env 配置实例 —</option>");
+  if (current) sel.value = current;
+}
+function instanceName(id) {
+  var instances = (S.cfg && S.cfg.k2018 && S.cfg.k2018.instances) || [];
+  for (var i = 0; i < instances.length; i++) {
+    if (instances[i].software_id === id) return instances[i].name;
+  }
+  return id ? (String(id).slice(-8)) : "—";
+}
 function openRule(id) {
   EDIT_ID = id || null;
   var r = null;
   if (EDIT_ID) {
     for (var i = 0; i < S.rules.length; i++) if (S.rules[i].id === EDIT_ID) r = S.rules[i];
   }
+  fillInstancePick();
   document.getElementById("rule-modal-title").textContent = r ? "编辑规则" : "新建规则";
   document.getElementById("rule-name").value = r ? r.name : "";
   document.getElementById("rule-mode").value = r ? r.mode : "upstream";
   document.getElementById("rule-item").value = r ? r.item_id : "*";
   document.getElementById("rule-priority").value = r ? r.priority : 0;
-  document.getElementById("rule-mult").value = r ? r.usd_multiplier : 1;
-  document.getElementById("rule-fixed").value = r ? r.fixed_usd : 0;
+  document.getElementById("rule-instance").value = r ? (r.software_id || "") : "";
+  document.getElementById("rule-duration-mode").value = r ? (r.duration_mode || "fixed") : "fixed";
+  document.getElementById("rule-fixed-days").value = r ? (r.fixed_days == null ? 1 : r.fixed_days) : 1;
+  document.getElementById("rule-days-per-cny").value = r ? (r.days_per_cny || 1) : 1;
+  RULE_TIERS = parseTiers(r ? r.price_tiers : []);
+  RULE_TIER_ITEM = r && RULE_TIERS.length ? r.item_id : "";
+  renderTiers(RULE_TIERS);
   document.getElementById("rule-confirm").checked = r ? !!r.auto_confirm : true;
   document.getElementById("rule-content").value = r ? r.content : "";
   if (!r) {
-    document.getElementById("rule-content").value =
-      "你好 {buyer}，这是你的卡密：\n\n{card}\n\n额度 {quota} 美元，如有问题直接回复本消息。";
+    document.getElementById("rule-content").value = DEFAULT_CARD_CONTENT;
   }
   onRuleMeta();
   document.getElementById("rule-modal").classList.add("open");
   setTimeout(function () { document.getElementById("rule-name").focus(); }, 60);
+  // 编辑「按规格」规则但旧数据没存档位时，自动拉一次详情，省得用户再点
+  if (r && r.duration_mode === "tiers" && !RULE_TIERS.length) setTimeout(loadSkus, 120);
 }
 function closeRule() {
   document.getElementById("rule-modal").classList.remove("open");
@@ -900,54 +1132,101 @@ function closeRule() {
 }
 function onRuleMeta() {
   var mode = document.getElementById("rule-mode").value;
-  document.getElementById("rule-upstream-fields").style.display = mode === "upstream" ? "grid" : "none";
+  var upstream = mode === "upstream";
+  var minidaily = mode === "minidaily";
+  var durationMode = document.getElementById("rule-duration-mode").value;
+  var tierMode = durationMode === "tiers";
+  var delivery = upstream || minidaily;
+  document.getElementById("rule-instance-field").style.display = upstream ? "grid" : "none";
+  document.getElementById("rule-duration-mode-field").style.display = delivery ? "grid" : "none";
+  document.getElementById("rule-upstream-fields").style.display = delivery ? "grid" : "none";
+  document.getElementById("rule-duration-fields").style.display = delivery && !tierMode ? "grid" : "none";
+  document.getElementById("rule-tier-fields").style.display = delivery && tierMode ? "block" : "none";
+  document.getElementById("rule-fixed-days").disabled = durationMode !== "fixed";
+  document.getElementById("rule-days-per-cny").disabled = durationMode !== "per_amount";
+  var content = document.getElementById("rule-content");
+  if (minidaily && (!content.value.trim() || content.value === DEFAULT_CARD_CONTENT)) {
+    content.value = DEFAULT_QR_CONTENT;
+  }
   updateQuotaNote();
   updatePreview();
 }
-// 「额度」的单位由 new-api 站点决定（quota_display_type）。站点设成 CNY 时
-// 额度就是人民币，直接写 $ 会让人以为发的是美元，看着像多发了好几倍。
-function quotaUnit() {
-  var cur = (S.cfg && S.cfg.newapi && S.cfg.newapi.currency) || "USD";
-  return cur === "CNY" ? "¥" : cur === "CUSTOM" ? "¤" : "$";
+function dayText(days) {
+  var n = Number(days);
+  if (!isFinite(n)) return "—";
+  return n === 0 ? "永久" : n + " 天";
+}
+function sampleDays() {
+  var mode = document.getElementById("rule-duration-mode").value;
+  if (mode === "fixed") return Math.max(0, Math.round(Number(document.getElementById("rule-fixed-days").value || 0)));
+  if (mode === "tiers") {
+    var tiers = collectTiers();
+    return tiers.length ? Math.max(0, Number(tiers[0].days == null ? 1 : tiers[0].days)) : 1;
+  }
+  var per = Number(document.getElementById("rule-days-per-cny").value || 1);
+  var picked = Number(ITEM_PRICES[document.getElementById("rule-item").value.trim()] || 10);
+  return Math.max(1, Math.round(picked * per));
 }
 function updateQuotaNote() {
   var el = document.getElementById("quota-note");
   var mode = document.getElementById("rule-mode").value;
-  if (mode !== "upstream" || !S.cfg) { el.textContent = ""; return; }
-  var fixed = Number(document.getElementById("rule-fixed").value || 0);
-  var mult = Number(document.getElementById("rule-mult").value || 1);
-  var rate = S.cfg.cny_per_usd || 1;
-  var unit = quotaUnit();
-  if (fixed > 0) { el.textContent = "额度固定为 " + unit + fixed.toFixed(2) + "，不看订单金额"; return; }
-  var picked = ITEM_PRICES[document.getElementById("rule-item").value.trim()];
-  var parts = [];
-  if (picked) parts.push("本商品 ¥" + picked + " → " + unit + ((picked / rate) * mult).toFixed(2));
-  parts.push("¥10 → " + unit + ((10 / rate) * mult).toFixed(2));
-  parts.push("¥50 → " + unit + ((50 / rate) * mult).toFixed(2));
-  el.textContent = parts.join("　·　") + "　（" + rate + " 元 = " + unit + "1）";
-}
-function sampleQuota() {
-  var fixed = Number(document.getElementById("rule-fixed").value || 0);
-  if (fixed > 0) return fixed;
-  var mult = Number(document.getElementById("rule-mult").value || 1);
-  var rate = (S.cfg && S.cfg.cny_per_usd) || 1;
-  var picked = ITEM_PRICES[document.getElementById("rule-item").value.trim()];
-  return ((picked || 10) / rate) * mult;
+  if ((mode !== "upstream" && mode !== "minidaily") || !S.cfg) { el.textContent = ""; return; }
+  var itemId = document.getElementById("rule-item").value.trim();
+  var info = ITEM_INFO[itemId] || null;
+  var price = Number(ITEM_PRICES[itemId] || 0);
+  var title = info && info.title ? String(info.title) : "";
+  if (title.length > 22) title = title.slice(0, 22) + "…";
+  var head = title ? "当前商品「" + title + "」" : "当前商品";
+  if (price > 0) head += " ¥" + price;
+  var durationMode = document.getElementById("rule-duration-mode").value;
+  if (durationMode === "tiers") {
+    var tiers = collectTiers();
+    if (!tiers.length) {
+      el.textContent = head + " → 按商品规格：先点「拉取规格」，再逐档填天数";
+      return;
+    }
+    el.textContent = head + " → " + tiers.map(function (t) {
+      return (t.label || "规格") + " ¥" + t.price + " = " + dayText(t.days);
+    }).join("　·　");
+    return;
+  }
+  if (durationMode === "fixed") {
+    var fixed = Number(document.getElementById("rule-fixed-days").value || 0);
+    el.textContent = head + " → 每单固定 " + dayText(fixed) + "（不随订单金额变）";
+    return;
+  }
+  var per = Number(document.getElementById("rule-days-per-cny").value || 1);
+  var current = price > 0 ? Math.max(1, Math.round(price * per)) : 0;
+  var detail = current ? " → " + current + " 天" : "";
+  el.textContent = head + detail + "　（每 1 元 = " + per + " 天，四舍五入；¥10 → " +
+    Math.max(1, Math.round(10 * per)) + " 天）";
 }
 function updatePreview() {
   var tpl = document.getElementById("rule-content").value;
   var el = document.getElementById("rule-preview");
   if (!tpl.trim()) { el.textContent = "（文案是空的，买家会收到一条空消息）"; return; }
+  var previewItem = document.getElementById("rule-item").value.trim();
+  var previewAmount = Number(ITEM_PRICES[previewItem] || 10);
+  if (document.getElementById("rule-duration-mode").value === "tiers") {
+    var previewTiers = collectTiers();
+    if (previewTiers.length) previewAmount = Number(previewTiers[0].price || previewAmount);
+  }
+  var previewDays = sampleDays();
   var sample = {
     buyer: "小明",
-    item_id: document.getElementById("rule-item").value.trim() || "*",
+    item_id: previewItem || "*",
     order_id: "2503688126356636370",
-    card: "ABCDE-FGHIJ-KLMNO-PQRST",
+    card: "0123456789ABCDEF0123456789ABCDEF",
+    qr_url: "https://scancode.miraclesplus.top/join?t=示例邀请码",
     date: new Date().toLocaleString("zh-CN"),
-    amount: "10.00",
-    quota: sampleQuota().toFixed(2)
+    amount: previewAmount.toFixed(2),
+    days: previewDays === 0 ? "永久" : String(previewDays),
+    quota: previewDays === 0 ? "永久" : String(previewDays)
   };
   var out = tpl;
+  if (previewDays === 0) {
+    out = out.replace(/\{days\}\s*天/g, "永久").replace(/\{quota\}\s*天/g, "永久");
+  }
   for (var k in sample) out = out.split("{" + k + "}").join(sample[k]);
   el.textContent = out;
 }
@@ -956,15 +1235,37 @@ async function saveRule() {
   if (!name) { toast("规则名不能为空", true); document.getElementById("rule-name").focus(); return; }
   var content = document.getElementById("rule-content").value;
   if (!content.trim()) { toast("发货文案不能为空，否则买家会收到空消息", true); return; }
+  var mode = document.getElementById("rule-mode").value;
+  var minidaily = mode === "minidaily";
+  if (mode === "upstream" && !document.getElementById("rule-instance").value) {
+    toast("请选择 2018K 实例（先在 .env 配置 XY_2018K_INSTANCES）", true); return;
+  }
+  var itemId = document.getElementById("rule-item").value.trim() || "*";
+  var durationMode = document.getElementById("rule-duration-mode").value;
+  var tiers = collectTiers();
+  var fixedDays = Number(document.getElementById("rule-fixed-days").value || 0);
+  if (minidaily && !(fixedDays >= 0)) {
+    toast("二维码挂载天数不能为负数", true); return;
+  }
+  if ((mode === "upstream" || minidaily) && durationMode === "tiers") {
+    if (!tiers.length) { toast("先点「拉取规格」，再给每个规格填天数", true); return; }
+    if (RULE_TIER_ITEM !== itemId) { toast("当前规格不属于这个商品，请重新点「拉取规格」", true); return; }
+    for (var i = 0; i < tiers.length; i++) {
+      if (!(tiers[i].days >= 0)) { toast("规格「" + tiers[i].label + "」的天数不能为负数", true); return; }
+    }
+  }
   var body = JSON.stringify({
     name: name,
-    item_id: document.getElementById("rule-item").value.trim() || "*",
-    mode: document.getElementById("rule-mode").value,
+    item_id: itemId,
+    mode: mode,
     content: content,
     auto_confirm: document.getElementById("rule-confirm").checked,
     priority: Number(document.getElementById("rule-priority").value || 0),
-    usd_multiplier: Number(document.getElementById("rule-mult").value || 1),
-    fixed_usd: Number(document.getElementById("rule-fixed").value || 0),
+    software_id: minidaily ? "" : (document.getElementById("rule-instance").value || ""),
+    duration_mode: durationMode,
+    fixed_days: fixedDays,
+    days_per_cny: Number(document.getElementById("rule-days-per-cny").value || 1),
+    price_tiers: tiers,
     enabled: true
   });
   try {
@@ -1193,7 +1494,9 @@ function orderPill(status) {
   var map = {
     delivered: ["ok", "已发货"],
     send_failed: ["err", "发送失败"],
-    upstream_failed: ["warn", "上游失败"]
+    confirm_failed: ["err", "确认发货失败（未发卡）"],
+    upstream_failed: ["warn", "2018K 建卡失败"],
+    invite_failed: ["warn", "二维码生成失败"]
   };
   var m = map[status] || ["plain", status];
   return "<span class='pill " + m[0] + "'><span class='dot'></span>" + esc(m[1]) + "</span>";
@@ -1229,13 +1532,17 @@ function renderOverviewBanner() {
   var out = "";
   if (S.cfg.dry_run) {
     out += "<div class='banner warn' style='margin-bottom:12px'><span class='ic'>🧪</span><div>" +
-      "<b>当前是 DRY-RUN 模式</b> —— 只会打日志，不会真的发消息、也不会建 Key。" +
+      "<b>当前是 DRY-RUN 模式</b> —— 只会打日志，不会真的发消息、也不会建 2018K 卡密。" +
       "确认流程跑通后把 <code>XY_DRY_RUN=0</code> 再重启。</div></div>";
   }
-  if (!S.cfg.upstream_ready) {
+  if (!S.cfg.k2018 || !S.cfg.k2018.ready) {
     out += "<div class='banner err'><span class='ic'>⚠️</span><div>" +
-      "<b>上游未配置齐全</b> —— 选了「按订单金额建 Key」的规则会直接失败。" +
-      "检查 <code>.env</code> 里的 <code>XY_NEWAPI_*</code> 与 <code>XY_CARDSHOP_*</code>。</div></div>";
+      "<b>2018K 未配置齐全</b> —— 选了「2018K 卡密」的规则会直接失败。" +
+      "检查 <code>.env</code> 里的 <code>XY_2018K_OPENID</code> 与 <code>XY_2018K_INSTANCES</code>。</div></div>";
+  } else if (S.cfg.k2018.health && S.cfg.k2018.health.ok === false) {
+    out += "<div class='banner err'><span class='ic'>⚠️</span><div>" +
+      "<b>2018K 连接异常</b> —— " + esc(S.cfg.k2018.health.error || "实例自检失败") +
+      "；选「2018K 卡密」的规则会发货失败。</div></div>";
   } else if (S.accounts.length && S.rules.length === 0) {
     out += "<div class='banner warn'><span class='ic'>💡</span><div>" +
       "<b>还没配发货规则</b> —— 有买家付款也不会发货，去「发货规则」建一条。</div></div>";
@@ -1289,24 +1596,64 @@ function renderAccounts() {
 function renderRules() {
   var banner = document.getElementById("rules-banner");
   if (S.cfg) {
-    if (!S.cfg.upstream_ready) {
+    var k = S.cfg.k2018 || {};
+    if (!k.ready) {
       banner.innerHTML = "<div class='banner warn'><span class='ic'>⚠️</span><div>" +
-        "<b>上游未配置</b> —— 可以先用「本地卡密池」或「固定文案」模式，“按订单金额建 Key”要等 new-api / 卡密站配好。</div></div>";
+        "<b>2018K 未配置</b> —— 可以先用「本地卡密池」或「固定文案」模式；" +
+        "「2018K 卡密」要先在「设置」页配好 OpenId 与实例。</div></div>";
     } else {
-      var models = S.cfg.newapi.model_limits || "";
-      banner.innerHTML = "<div class='banner ok'><span class='ic'>✅</span><div><b>上游已接通</b>　" +
-        "new-api <code>" + esc(S.cfg.newapi.base_url) + "</code> → 卡密站 <code>" + esc(S.cfg.cardshop.base_url) +
-        "</code>　·　" + S.cfg.cny_per_usd + " 元 = " + quotaUnit() + "1　·　" +
-        (models ? "新建 Key 仅限 <code>" + esc(models) + "</code>" : "<b style='color:var(--err)'>新建 Key 不限模型</b>") +
+      var names = (k.instances || []).map(function (it) { return it.name; }).join(" / ");
+      var h = k.health || {};
+      var state = h.ok === true ? "2018K 已接通" : h.ok === false ? "2018K 连接异常" : "2018K 未检测";
+      var cls = h.ok === true ? "banner ok" : h.ok === false ? "banner err" : "banner warn";
+      var icon = h.ok === true ? "✅" : h.ok === false ? "⚠️" : "⏳";
+      banner.innerHTML = "<div class='" + cls + "'><span class='ic'>" + icon + "</span><div><b>" + state + "</b>　" +
+        "实例：<code>" + esc(names) + "</code>　·　" +
+        (k.admin_ready ? "后台账号已配置（失败可自动删卡）" : "<b style='color:var(--warn)'>未配后台账号，失败只能人工删卡</b>") +
+        (h.ok === false ? "<br>原因：" + esc(h.error || "实例自检失败") + "；修好连接前发货会失败。" : "") +
         "</div></div>";
+    }
+    var unbound = S.rules.filter(function (r) {
+      return r.mode === "upstream" && !r.software_id;
+    });
+    if (unbound.length) {
+      banner.innerHTML += "<div class='banner warn' style='margin-top:10px'><span class='ic'>⚠️</span><div>" +
+        "<b>" + unbound.length + " 条 2018K 规则还没绑定实例</b> —— 这些规则发货会直接失败。" +
+        "点「编辑」选好实例和卡密时长后再保存。</div></div>";
+    }
+    var oldQuota = S.rules.filter(function (r) {
+      return r.mode === "upstream" && /\{quota\}|美元|USD/.test(r.content || "");
+    });
+    if (oldQuota.length) {
+      banner.innerHTML += "<div class='banner warn' style='margin-top:10px'><span class='ic'>✏️</span><div>" +
+        "<b>" + oldQuota.length + " 条规则的文案还在用旧占位符</b> —— " +
+        "<code>{quota}</code> 现在等于天数，建议改成 <code>{days}</code> 并去掉美元字样。</div></div>";
     }
   }
   document.getElementById("rules").innerHTML = S.rules.length ? S.rules.map(function (r) {
-    var strategy = r.mode !== "upstream" ? "<span class='muted'>—</span>"
-      : (Number(r.fixed_usd) > 0 ? "固定 " + usd(r.fixed_usd)
-        : "金额 × " + r.usd_multiplier + " ÷ 汇率");
-    var modeName = r.mode === "upstream" ? "上游建 Key" : r.mode === "card" ? "本地卡密池" : "固定文案";
-    var modeCls = r.mode === "upstream" ? "info" : r.mode === "card" ? "plain" : "plain";
+    var price = Number(ITEM_PRICES[r.item_id] || 0);
+    var info = ITEM_INFO[r.item_id] || null;
+    var priceText = price > 0 ? "¥" + price + (info && info.is_sku ? "起" : "") + " · " : "";
+    var tierText = "";
+    if (r.duration_mode === "tiers") {
+      var tiers = parseTiers(r.price_tiers);
+      tierText = tiers.length
+        ? "按规格 " + tiers.map(function (t) { return (t.label || "档") + "=" + dayText(t.days); }).join(" / ")
+        : "按规格（未配置）";
+    }
+    var strategy = r.mode === "minidaily"
+      ? (r.duration_mode === "tiers" ? "二维码 " + tierText
+        : r.duration_mode === "per_amount" ? "二维码每元 " + (r.days_per_cny || 1) + " 天"
+        : "二维码挂载 " + dayText(r.fixed_days == null ? 1 : r.fixed_days))
+      : r.mode !== "upstream" ? "<span class='muted'>—</span>"
+      : (esc(instanceName(r.software_id)) + "　" + priceText +
+        (r.duration_mode === "fixed"
+          ? "固定 " + dayText(r.fixed_days == null ? 1 : r.fixed_days)
+          : r.duration_mode === "tiers" ? tierText
+          : "每元 " + (r.days_per_cny || 1) + " 天"));
+    var modeName = r.mode === "minidaily" ? "MiniDaily 二维码"
+      : r.mode === "upstream" ? "2018K 卡密" : r.mode === "card" ? "本地卡密池" : "固定文案";
+    var modeCls = r.mode === "upstream" ? "info" : r.mode === "minidaily" ? "info" : "plain";
     return "<tr><td><b>" + esc(r.name) + "</b></td>" +
       "<td><code>" + esc(r.item_id) + "</code></td>" +
       "<td><span class='pill " + modeCls + "'><span class='dot'></span>" + modeName + "</span></td>" +
@@ -1332,15 +1679,20 @@ function renderOrders() {
     ? "共 " + S.orders.length + " 条" + (rows.length !== S.orders.length ? "，筛出 " + rows.length + " 条" : "")
     : "还没有记录";
   document.getElementById("orders").innerHTML = rows.length ? rows.map(function (o) {
-    var detail = o.detail || (o.card_code ? "卡密 " + o.card_code : "");
+    var detail = o.detail || "";
+    var card = o.card_code
+      ? "<code style='word-break:break-all'>" + esc(o.card_code) + "</code>" +
+        "<button class='link' style='margin-left:6px' onclick=\"copyText('" + esc(o.card_code) + "')\">复制</button>"
+      : "—";
     return "<tr><td class='num muted' title='" + esc(o.created_at) + "'>" + relTime(o.created_at) + "</td>" +
       "<td><code>" + esc(o.order_id || "—") + "</code></td>" +
       "<td>" + esc(o.buyer_name || o.buyer_id || "—") + "</td>" +
       "<td class='num'>" + yuan(o.amount_cny) + "</td>" +
-      "<td class='num'>" + usd(o.quota_usd) + "</td>" +
+      "<td class='num'>" + (o.duration_days == null ? "—" : (o.duration_days === 0 ? "永久" : o.duration_days + " 天")) + "</td>" +
+      "<td class='muted tiny' style='max-width:260px'>" + card + "</td>" +
       "<td>" + orderPill(o.status) + "</td>" +
       "<td class='muted tiny' style='max-width:280px'>" + esc(detail || "—") + "</td></tr>";
-  }).join("") : emptyRow(7, q || st ? "没有匹配的记录" : "还没有发货记录", "📦");
+  }).join("") : emptyRow(8, q || st ? "没有匹配的记录" : "还没有发货记录", "📦");
 }
 
 function renderCards() {
@@ -1362,106 +1714,326 @@ function renderCards() {
   }).join("") : emptyRow(6, "还没有卡密，把卡密粘到上面的框里导入", "🔑");
 }
 
+function messageType(content) {
+  var text = String(content || "").trim();
+  if (text.indexOf("[卡片消息]") === 0) return "card";
+  if (text.charAt(0) === "[" && text.indexOf("]") > 0) return "system";
+  if (text.indexOf("快给ta一个评价") >= 0 || text.indexOf("卖家人不错") >= 0
+      || text.indexOf("买家确认收货") >= 0 || text.indexOf("交易成功") >= 0
+      || text.indexOf("去评价") >= 0) return "system";
+  return "text";
+}
+function messageSource(m) {
+  if (m.msg_type === "trade") return "trade";
+  if (m.msg_type === "chat") return "chat";
+  return messageType(m.content) === "text" ? "chat" : "trade";
+}
+function messageUserKey(m) {
+  return m.sender_id || m.sender_name || "unknown";
+}
 function renderMessages() {
   var q = (document.getElementById("msgs-q").value || "").trim().toLowerCase();
   var rows = S.messages.filter(function (m) {
     if (!q) return true;
     return ((m.sender_name || "") + " " + (m.content || "") + " " + (m.sender_id || "")).toLowerCase().indexOf(q) >= 0;
   });
+
+  var groups = {};
+  rows.forEach(function (m) {
+    var key = messageUserKey(m);
+    var g = groups[key];
+    if (!g) {
+      g = groups[key] = {
+        key: key, name: "", received: 0, sent: 0,
+        chat: 0, trade: 0, total: 0, last: "", lastContent: ""
+      };
+    }
+    if (m.sender_name) g.name = m.sender_name;
+    if (m.kind === "outgoing") g.sent += 1;
+    else g.received += 1;
+    g[messageSource(m)] += 1;
+    g.total += 1;
+    var at = String(m.created_at || "");
+    if (at >= g.last) {
+      g.last = at;
+      g.lastContent = m.content || "";
+    }
+  });
+  var summary = Object.keys(groups).map(function (k) { return groups[k]; }).sort(function (a, b) {
+    return b.last.localeCompare(a.last) || b.total - a.total;
+  });
+  var nameCounts = {};
+  summary.forEach(function (g) {
+    var n = g.name || g.key;
+    nameCounts[n] = (nameCounts[n] || 0) + 1;
+  });
+  document.getElementById("messages-summary").innerHTML = summary.length ? summary.map(function (g) {
+    var label = g.name || g.key;
+    if (g.name === "买家" || !g.name || nameCounts[label] > 1) {
+      label += "（…" + String(g.key).slice(-4) + "）";
+    }
+    return "<tr><td title='" + esc(g.key) + "'><b>" + esc(label) + "</b></td>" +
+      "<td class='num'>" + g.received + "</td>" +
+      "<td class='num'>" + g.sent + "</td>" +
+      "<td class='num'>" + g.chat + "</td>" +
+      "<td class='num'>" + g.trade + "</td>" +
+      "<td class='num'><b>" + g.total + "</b></td>" +
+      "<td class='num muted' style='white-space:nowrap'>" + exactTime(g.last) + "</td>" +
+      "<td class='muted' style='max-width:340px'>" + esc((g.lastContent || "").slice(0, 80)) + "</td></tr>";
+  }).join("") : emptyRow(8, q ? "没有匹配的消息" : "还没有消息", "💬");
+
   document.getElementById("msgs-count").textContent = S.messages.length
-    ? "最近 " + S.messages.length + " 条" + (rows.length !== S.messages.length ? "，筛出 " + rows.length + " 条" : "")
+    ? "最近 " + S.messages.length + " 条 · " + summary.length + " 位用户" +
+      (rows.length !== S.messages.length ? "，筛出 " + rows.length + " 条" : "")
     : "还没有消息";
   document.getElementById("messages").innerHTML = rows.length ? rows.map(function (m) {
     var out = m.kind === "outgoing";
-    return "<tr><td class='num muted' title='" + esc(m.created_at) + "'>" + relTime(m.created_at) + "</td>" +
+    var source = messageSource(m);
+    return "<tr><td class='num muted' style='white-space:nowrap'>" + exactTime(m.created_at) + "</td>" +
       "<td>" + (out ? "<span class='pill info'><span class='dot'></span>发出</span>"
                      : "<span class='pill plain'><span class='dot'></span>收到</span>") + "</td>" +
+      "<td>" + (source === "trade"
+        ? "<span class='pill warn'><span class='dot'></span>交易通知</span>"
+        : "<span class='pill info'><span class='dot'></span>聊天</span>") + "</td>" +
       "<td>" + esc(m.sender_name || m.sender_id || "—") + "</td>" +
       "<td style='max-width:520px'>" + esc((m.content || "").slice(0, 110)) + "</td></tr>";
-  }).join("") : emptyRow(4, q ? "没有匹配的消息" : "还没有消息", "💬");
+  }).join("") : emptyRow(5, q ? "没有匹配的消息" : "还没有消息", "💬");
 }
-
-/* ---------- 设置 ---------- */
-var SETTINGS_DIRTY = false;
-var MODEL_LIMITS_SOURCE = { web: "来自后台设置", env: "来自 .env（XY_NEWAPI_MODEL_LIMITS）", "default": "内置默认值" };
-
-// 与后端 normalize_model_limits 同一规则：中文逗号 → 英文，按空白/逗号切开，去空去重
-function normalizeModelLimits(raw) {
-  var text = String(raw == null ? "" : raw).replace(/，/g, ",");
-  var out = [];
-  text.split(",").forEach(function (chunk) {
-    chunk.split(/\s+/).forEach(function (name) {
-      if (name && out.indexOf(name) < 0) out.push(name);
-    });
-  });
-  return out.join(",");
-}
-
-function updateModelLimitsPreview() {
-  SETTINGS_DIRTY = true;
-  var models = normalizeModelLimits(document.getElementById("set-model-limits").value);
-  var prev = document.getElementById("set-model-limits-preview");
-  if (!prev) return;
-  prev.textContent = models
-    ? 'model_limits_enabled = true\nmodel_limits = "' + models + '"'
-    : 'model_limits_enabled = false   ← 不限制模型，买家可调任意模型';
-}
-
-function renderSettings() {
-  if (!S.cfg) return;
-  var box = document.getElementById("settings-banner");
-  var info = S.cfg.newapi || {};
-  if (info.model_limits_unlimited) {
-    box.innerHTML = "<div class='banner warn'><span class='ic'>⚠️</span><div>" +
-      "<b>新建的 Key 目前不限模型</b> —— 买家拿到 Key 能调任意（更贵的）模型。" +
-      "在下面填上允许的模型并保存即可，不用改 .env。</div></div>";
-  } else {
-    box.innerHTML = "<div class='banner ok'><span class='ic'>✅</span><div>" +
-      "<b>新建 Key 仅限 <code>" + esc(info.model_limits) + "</code></b>" +
-      " —— 买家拿 Key 也调不了别的模型。</div></div>";
-  }
-  // 只在用户没在编辑时回填，否则每 5 秒刷新会把手里的输入冲掉
-  var input = document.getElementById("set-model-limits");
-  if (input && !SETTINGS_DIRTY && document.activeElement !== input) {
-    input.value = info.model_limits || "";
-    updateModelLimitsPreview();
-    SETTINGS_DIRTY = false;
-  }
-  var src = document.getElementById("set-model-limits-source");
-  if (src) {
-    src.textContent = MODEL_LIMITS_SOURCE[info.model_limits_source] || "";
-  }
-}
-
-async function saveSettings() {
-  var models = normalizeModelLimits(document.getElementById("set-model-limits").value);
-  if (!models) {
-    if (!confirm("留空 = 之后新建的 Key 不限制模型，买家可以调用任意模型。\n确定要这样吗？")) return;
-  }
+async function clearMessages() {
+  if (!S.messages.length) { toast("没有消息可清空"); return; }
+  if (!confirm("清空全部消息流水？\n\n只删除消息记录，订单、规则和卡密不受影响；此操作不可恢复。")) return;
   try {
-    var r = await api("/api/config/settings", {
-      method: "PUT", body: JSON.stringify({ model_limits: models })
-    });
-    SETTINGS_DIRTY = false;
-    document.getElementById("set-model-limits").value = r.model_limits.value || "";
-    toast(models ? "已保存，新建 Key 仅限 " + models : "已保存：新建 Key 不限制模型");
-    await refresh();
+    var r = await api("/api/messages", { method: "DELETE" });
+    toast("已清空 " + (r.deleted || 0) + " 条消息");
+    await refresh(true);
   } catch (e) { toast(e.message, true); }
 }
 
-function resetModelLimits() {
-  var input = document.getElementById("set-model-limits");
-  input.value = "deepseek-v4.1-flash";
-  SETTINGS_DIRTY = true;
-  updateModelLimitsPreview();
+/* ---------- 设置 ---------- */
+function renderSettings() {
+  if (!S.cfg) return;
+  var box = document.getElementById("settings-banner");
+  var k = S.cfg.k2018 || {};
+  if (!k.ready) {
+    var missing = !k.openid_set ? "OpenId" : "2018K 实例";
+    box.innerHTML = "<div class='banner err'><span class='ic'>⚠️</span><div>" +
+      "<b>2018K 未配置</b> —— 还缺 " + missing +
+      "。在下方填好并保存即可，不用改 .env、不用重启。</div></div>";
+  } else {
+    var h = k.health || {};
+    if (h.ok === false) {
+      box.innerHTML = "<div class='banner err'><span class='ic'>⚠️</span><div>" +
+        "<b>2018K 连接异常</b> —— " + esc(h.error || "实例自检失败") +
+        "。配置已保存，但当前发货会失败；请检查 OpenId、实例和网络后点下方「重新检测」。</div></div>";
+    } else if (h.ok === true) {
+      box.innerHTML = "<div class='banner ok'><span class='ic'>✅</span><div>" +
+        "<b>2018K 已接通</b> —— " + (k.instances || []).length + " 个实例；" +
+        (k.admin_ready ? "后台账号已配置，失败可自动删卡。" : "未配后台账号，发货失败需要手动删卡。") +
+        "</div></div>";
+    } else {
+      box.innerHTML = "<div class='banner warn'><span class='ic'>⏳</span><div>" +
+        "<b>2018K 配置已保存，尚未检测连接</b> —— 点下方「重新检测」获取当前状态。</div></div>";
+    }
+  }
+  if (!K2018_FORM_LOADED) {
+    fillK2018Form(k);
+    K2018_FORM_LOADED = true;
+  }
+  var social = S.cfg.social || {};
+  if (!SOCIAL_FORM_LOADED) {
+    document.getElementById("social-auto-receive-flower").checked = social.auto_receive_flower !== false;
+    document.getElementById("social-auto-flower").checked = !!social.auto_flower;
+    document.getElementById("social-auto-remind").checked = !!social.auto_remind_receipt;
+    document.getElementById("social-auto-rate").checked = !!social.auto_rate;
+    document.getElementById("social-rate-content").value = social.rate_content || "很好，合作愉快！";
+    SOCIAL_FORM_LOADED = true;
+  }
+  var health = k.health || {};
+  var healthText = health.ok === true ? "正常" : health.ok === false ? "<b style='color:var(--err)'>异常</b>"
+    : (health.checked_at ? "检测中" : "未检测");
+  document.getElementById("k2018-status").innerHTML =
+    "<p class='tiny muted' style='margin:0'>当前状态：OpenId " +
+    (k.openid_set ? "已配置" : "<b style='color:var(--err)'>未配置</b>") +
+    "　·　连接 " + healthText +
+    "　·　上次检测 " + epochTime(health.checked_at) +
+    "（仅启动、保存或手动检测，不自动轮询）" +
+    "　·　后台账号 " + (k.admin_ready ? "已配置" : "未配置（不影响发货）") +
+    "　·　实例 " + (k.instances || []).length + " 个" +
+    "　·　接口 <code>" + esc(k.api_base || "") + "</code></p>";
+}
+function k2018InstanceRow(name, softwareId) {
+  return "<div class='k2018-instance' style='display:grid;grid-template-columns:1fr 2fr auto;gap:8px;margin-bottom:7px'>" +
+    "<input class='in k2018-inst-name' maxlength='32' placeholder='实例名，如 Miracles' value='" + esc(name || "") + "' />" +
+    "<input class='in k2018-inst-id' maxlength='32' placeholder='32 位 softwareId' value='" + esc(softwareId || "") + "' />" +
+    "<button class='btn' style='color:var(--err)' onclick='removeK2018Instance(this)'>删除</button></div>";
+}
+function fillK2018Form(k) {
+  var openid = document.getElementById("k2018-openid");
+  openid.value = "";
+  openid.placeholder = k.openid_set ? "已配置（留空不修改）" : "首次配置请填 32 位 OpenId";
+  var user = document.getElementById("k2018-admin-user");
+  var pass = document.getElementById("k2018-admin-pass");
+  user.value = ""; pass.value = "";
+  user.placeholder = k.admin_ready ? "已配置（留空不修改）" : "用于自动删卡，可留空";
+  pass.placeholder = k.admin_ready ? "已配置（留空不修改）" : "可留空";
+  document.getElementById("k2018-clear-admin").checked = false;
+  var box = document.getElementById("k2018-instances");
+  var items = k.instances || [];
+  box.innerHTML = items.map(function (it) { return k2018InstanceRow(it.name, it.software_id); }).join("");
+  if (!items.length) addK2018Instance("", "", false);
+}
+function addK2018Instance(name, softwareId, focus) {
+  var box = document.getElementById("k2018-instances");
+  box.insertAdjacentHTML("beforeend", k2018InstanceRow(name, softwareId));
+  if (!name && focus !== false) {
+    var rows = box.querySelectorAll(".k2018-instance");
+    var last = rows[rows.length - 1];
+    if (last) last.querySelector(".k2018-inst-name").focus();
+  }
+}
+function removeK2018Instance(btn) {
+  var row = btn.closest(".k2018-instance");
+  if (!row) return;
+  var sid = (row.querySelector(".k2018-inst-id").value || "").trim();
+  var used = (S.rules || []).some(function (r) { return r.software_id === sid; });
+  if (used && !confirm("有规则正在使用这个实例，删除后这些规则发货会失败。继续删除？")) return;
+  row.remove();
+}
+function collectK2018Instances() {
+  var rows = document.querySelectorAll("#k2018-instances .k2018-instance");
+  var out = [];
+  for (var i = 0; i < rows.length; i++) {
+    var name = (rows[i].querySelector(".k2018-inst-name").value || "").trim();
+    var sid = (rows[i].querySelector(".k2018-inst-id").value || "").trim().toUpperCase();
+    if (!name && !sid) continue;
+    out.push({ name: name, software_id: sid });
+  }
+  return out;
+}
+async function saveK2018() {
+  var k = (S.cfg && S.cfg.k2018) || {};
+  var openid = (document.getElementById("k2018-openid").value || "").trim();
+  if (openid && !/^[0-9a-fA-F]{32}$/.test(openid)) {
+    toast("OpenId 必须是 32 位十六进制字符串", true); return;
+  }
+  if (!openid && !k.openid_set) {
+    toast("首次配置必须填写 OpenId", true); return;
+  }
+  var instances = collectK2018Instances();
+  var names = {}, ids = {};
+  for (var i = 0; i < instances.length; i++) {
+    var it = instances[i];
+    if (!it.name) { toast("实例名不能为空", true); return; }
+    if (!/^[0-9A-F]{32}$/.test(it.software_id)) {
+      toast("实例「" + it.name + "」的 softwareId 不是 32 位十六进制", true); return;
+    }
+    if (names[it.name.toLowerCase()]) { toast("实例名重复：" + it.name, true); return; }
+    if (ids[it.software_id]) { toast("softwareId 重复：" + it.software_id, true); return; }
+    names[it.name.toLowerCase()] = true;
+    ids[it.software_id] = true;
+  }
+  if (!instances.length && !confirm("没有实例，2018K 将暂时不可用。继续保存？")) return;
+  var body = JSON.stringify({
+    openid: openid,
+    instances: instances,
+    admin_username: (document.getElementById("k2018-admin-user").value || "").trim(),
+    admin_password: document.getElementById("k2018-admin-pass").value || "",
+    clear_admin: document.getElementById("k2018-clear-admin").checked
+  });
+  var btn = document.getElementById("k2018-save");
+  var status = document.getElementById("k2018-save-status");
+  btn.disabled = true;
+  status.textContent = "保存中…";
+  try {
+    await api("/api/config/k2018", { method: "PUT", body: body });
+    status.textContent = "已保存";
+    K2018_FORM_LOADED = false;
+    toast("2018K 配置已保存，已即时生效");
+    await refresh(true);
+  } catch (e) {
+    status.textContent = "";
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+async function saveSocial() {
+  var body = JSON.stringify({
+    auto_flower: document.getElementById("social-auto-flower").checked,
+    auto_remind_receipt: document.getElementById("social-auto-remind").checked,
+    auto_rate: document.getElementById("social-auto-rate").checked,
+    auto_receive_flower: document.getElementById("social-auto-receive-flower").checked,
+    rate_content: document.getElementById("social-rate-content").value.trim()
+  });
+  var btn = document.getElementById("social-save");
+  var status = document.getElementById("social-save-status");
+  btn.disabled = true;
+  status.textContent = "保存中…";
+  try {
+    await api("/api/config/social", { method: "PUT", body: body });
+    status.textContent = "已保存";
+    SOCIAL_FORM_LOADED = false;
+    toast("订单自动化设置已保存");
+    await refresh(true);
+  } catch (e) {
+    status.textContent = "";
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+async function checkK2018Health() {
+  var btn = document.getElementById("k2018-check");
+  var old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "检测中…";
+  try {
+    await api("/api/k2018/check", { method: "POST" });
+    toast("2018K 连接检测完成");
+    await refresh(true);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
 }
 
 function renderSide() {
+  var acc = document.getElementById("side-accounts");
+  var accounts = (S.accounts || []).filter(function (a) { return a.enabled; });
+  var statuses = S.status || [];
+  var online = statuses.filter(function (s) { return s.status === "online"; }).length;
+  var connecting = statuses.some(function (s) {
+    return s.status === "connecting" || s.status === "token_expired" || s.status === "risk_control";
+  });
+  if (!accounts.length) {
+    acc.innerHTML = "<span class='dot err'></span><span>闲鱼未登录</span>";
+  } else if (online >= accounts.length) {
+    acc.innerHTML = "<span class='dot ok'></span><span>闲鱼在线 " + online + "/" + accounts.length + "</span>";
+  } else if (online > 0) {
+    acc.innerHTML = "<span class='dot warn'></span><span>闲鱼部分在线 " + online + "/" + accounts.length + "</span>";
+  } else if (connecting) {
+    acc.innerHTML = "<span class='dot warn'></span><span>闲鱼连接中…</span>";
+  } else {
+    acc.innerHTML = "<span class='dot err'></span><span>闲鱼未连接</span>";
+  }
+
   var up = document.getElementById("side-upstream");
-  if (S.cfg && S.cfg.upstream_ready) {
-    up.innerHTML = "<span class='dot ok'></span><span>上游已接通</span>";
-  } else if (S.cfg) {
-    up.innerHTML = "<span class='dot err'></span><span>上游未配置</span>";
+  if (!S.cfg || !S.cfg.k2018) {
+    up.innerHTML = "<span class='dot'></span><span>2018K 未检测</span>";
+  } else {
+    var k = S.cfg.k2018;
+    var h = k.health || {};
+    if (!k.ready) {
+      up.innerHTML = "<span class='dot err'></span><span>2018K 未配置</span>";
+    } else if (h.ok === false) {
+      up.innerHTML = "<span class='dot err'></span><span title='" + esc(h.error || "") + "'>2018K 连接异常</span>";
+    } else if (h.ok === true) {
+      up.innerHTML = "<span class='dot ok'></span><span>2018K 已接通</span>";
+    } else {
+      up.innerHTML = "<span class='dot warn'></span><span title='点设置页「重新检测」获取状态'>2018K 未检测</span>";
+    }
   }
   var mode = document.getElementById("side-mode");
   if (S.cfg) {

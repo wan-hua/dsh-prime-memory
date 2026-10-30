@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 
 import pytest
 
 from app.client import XianyuClient, _find_order_id, _url_param
+from app.codec import IncomingMessage
 from app.config import settings
 from app.db import Database
 from app.engine import DeliveryEngine
@@ -229,11 +231,67 @@ def set_connected_at(worker: AccountWorker, created_at_ms: int) -> None:
 def fast(monkeypatch):
     monkeypatch.setattr(settings, "auto_reply_delay", 0.0)
     monkeypatch.setattr(settings, "auto_reply_enabled", True)
+    # 这些用例用的是固定历史时间戳；单独测旧会话保护时再打开。
+    monkeypatch.setattr(settings, "message_stale_seconds", 0)
 
 
 async def finish_replies(worker: AccountWorker) -> None:
     for task in list(worker._reply_tasks):
         await task
+
+
+async def test_stale_conversation_is_ignored_even_after_baseline(db, fast, monkeypatch):
+    """会话最后一条已超过 1 天：即使不在基线轮，也整段忽略。"""
+    monkeypatch.setattr(settings, "message_stale_seconds", 86400)
+    old = int(time.time() * 1000) - 2 * 86400 * 1000
+    worker = await build_worker(db, [conversation(chat=CHAT, text="在吗", message_id="old-1", create_at=old)])
+    await save_item_reply(db)
+    worker._message_baseline_done = True
+
+    handled = await worker._poll_recent_messages()
+    await finish_replies(worker)
+    assert handled == 0
+    assert worker.client.sent == []
+
+
+async def test_stale_conversation_new_message_is_processed(db, fast, monkeypatch):
+    """旧会话里来了新消息：只处理新消息，旧历史仍然忽略。"""
+    monkeypatch.setattr(settings, "message_stale_seconds", 86400)
+    now = int(time.time() * 1000)
+    old = now - 2 * 86400 * 1000
+    worker = await build_worker(db, [conversation(chat=CHAT, text="旧消息", message_id="old-1", create_at=old)])
+    await save_item_reply(db)
+    worker._message_baseline_done = True
+    await worker._poll_recent_messages()
+    await finish_replies(worker)
+    assert worker.client.sent == []
+
+    worker.client.history_from([
+        history_record(text="新消息", message_id="new-1", create_at=now),
+        history_record(text="旧消息", message_id="old-1", create_at=old),
+    ])
+    worker.client.conversations = [conversation(message_id="new-1", create_at=now, text="新消息")]
+    handled = await worker._poll_recent_messages()
+    await finish_replies(worker)
+    assert handled == 1
+    assert len(worker.client.sent) == 1
+    assert "新消息" not in worker.client.sent[0][2]
+    assert "拍下自动发货" in worker.client.sent[0][2]
+
+
+async def test_stale_push_message_is_ignored(db, fast, monkeypatch):
+    """推送通道补发的旧消息也不能触发自动回复。"""
+    monkeypatch.setattr(settings, "message_stale_seconds", 86400)
+    old = int(time.time() * 1000) - 2 * 86400 * 1000
+    worker = await build_worker(db, [])
+    await save_item_reply(db)
+    msg = IncomingMessage(
+        chat_id=CHAT, sender_id=BUYER, sender_name="Hesjesy",
+        content="在吗", item_id=ITEM, created_at=old,
+    )
+    task = await worker._process_incoming(msg)
+    assert task is None
+    assert worker.client.sent == []
 
 
 async def test_history_messages_do_not_trigger_reply(db, fast):

@@ -6,7 +6,14 @@ import asyncio
 
 import pytest
 
+from app.config import settings
 from app.db import Database
+
+
+@pytest.fixture(autouse=True)
+def _disable_stale_guard(monkeypatch):
+    """测试用固定历史时间戳构造消息；旧会话保护在专门用例里单独打开。"""
+    monkeypatch.setattr(settings, "message_stale_seconds", 0)
 
 
 @pytest.fixture()

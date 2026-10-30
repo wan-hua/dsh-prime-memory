@@ -578,6 +578,141 @@ class XianyuClient:
             return True, ret
         return False, ret or "未知返回"
 
+    async def list_sold_orders(self, page_size: int = 100) -> list[dict[str, Any]]:
+        """拉卖家订单列表，保留状态、买家、评价状态和右侧按钮动作。
+
+        订单列表页的按钮元数据里有真实接口名（例如提醒收货、求小红花），
+        比硬编码猜测接口稳；自动化只对带对应按钮的订单执行动作。
+        """
+        payload = {
+            "pageNumber": 1,
+            "rowsPerPage": page_size,
+            "orderIds": "",
+            "queryCode": "ALL",
+            "orderSearchParam": "{}",
+        }
+        try:
+            resp = await self.mtop("mtop.taobao.idle.trade.merchant.sold.get", payload)
+        except XianyuError as exc:
+            logger.warning("拉订单列表失败：%s", exc)
+            return []
+        ret = " ".join(resp.get("ret", []))
+        if "SUCCESS" not in ret.upper():
+            logger.warning("订单列表返回异常：%s", ret)
+            return []
+        module = _as_dict_local((resp.get("data") or {}).get("module"))
+        items = module.get("items") or []
+        out: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            common = _as_dict_local(item.get("commonData"))
+            buyer = _as_dict_local(item.get("buyerInfoVO"))
+            right = _as_dict_local(item.get("rightVO"))
+            actions: dict[str, dict[str, Any]] = {}
+            for btn in right.get("btnList") or []:
+                if not isinstance(btn, dict):
+                    continue
+                action = str(btn.get("tradeAction") or "")
+                click = _as_dict_local(btn.get("clickEvent"))
+                if not action:
+                    continue
+                actions[action] = {
+                    "name": str(btn.get("name") or ""),
+                    "type": str(click.get("type") or ""),
+                    "data": _as_dict_local(click.get("data")),
+                }
+            order_id = str(common.get("orderId") or "").strip()
+            if not order_id:
+                continue
+            out.append({
+                "order_id": order_id,
+                "item_id": str(common.get("itemId") or "").strip(),
+                "buyer_id": str(buyer.get("buyerId") or "").strip(),
+                "buyer_name": buyer_nick_from_session(buyer),
+                "status": str(common.get("orderStatus") or "").strip(),
+                "seller_rate_status": common.get("sellerRateStatus"),
+                "create_time": common.get("createTime") or common.get("paySuccessTime") or 0,
+                "actions": actions,
+                "raw": item,
+            })
+        return out
+
+    async def remind_receipt(self, order_id: str) -> tuple[bool, str]:
+        """提醒买家确认收货；每日一次的判断由上层按订单记录。"""
+        try:
+            payload = await self.mtop(
+                "com.taobao.idle.trade.consign.remind", {"orderId": str(order_id)}
+            )
+        except XianyuError as exc:
+            return False, str(exc)
+        ret = " ".join(payload.get("ret", []))
+        if "SUCCESS" in ret.upper():
+            return True, ret
+        return False, ret or "未知返回"
+
+    async def require_flower(self, order_id: str) -> tuple[bool, str]:
+        """向买家求一朵小红花。"""
+        try:
+            payload = await self.mtop(
+                "mtop.taobao.idlemessage.red.flower", {"orderId": str(order_id)}
+            )
+        except XianyuError as exc:
+            return False, str(exc)
+        ret = " ".join(payload.get("ret", []))
+        if "SUCCESS" in ret.upper():
+            return True, ret
+        return False, ret or "未知返回"
+
+    async def receive_flower(self, order_id: str) -> tuple[bool, str]:
+        """领取买家送来的小红花。
+
+        来自 H5 小红花玩法页：mtop.taobao.red.flower.seller.receive。
+        asac 是页面固定值；channel/bizType 为空时服务端按普通订单处理。
+        返回 data.module.issued=true 才算真正领取成功。
+        """
+        try:
+            payload = await self.mtop(
+                "mtop.taobao.red.flower.seller.receive",
+                {
+                    "orderNo": str(order_id),
+                    "drawModel": 0,
+                    "channel": "",
+                    "bizType": "",
+                    "asac": "2A24124SCWTNPW40G6NQW9",
+                },
+                "1.0",
+            )
+        except XianyuError as exc:
+            return False, str(exc)
+        ret = " ".join(payload.get("ret", []))
+        data = payload.get("data") or {}
+        module = data.get("module") or {}
+        issued = bool(module.get("issued"))
+        if "SUCCESS" in ret.upper() and issued:
+            return True, ret
+        return False, ret or "未返回领取结果"
+
+    async def rate_buyer(self, order_id: str, feedback: str, rate: int = 1) -> tuple[bool, str]:
+        """给买家好评；rate=1 是好评，feedback 是评价内容。"""
+        data = {
+            "createOrAppend": 0,
+            "feedback": str(feedback or ""),
+            "imageUrls": [],
+            "rate": int(rate),
+            "selectedTags": None,
+            "tradeId": str(order_id),
+            "anonymous": False,
+        }
+        try:
+            payload = await self.mtop("mtop.taobao.idle.rate.create", data, version="4.0")
+        except XianyuError as exc:
+            return False, str(exc)
+        ret = " ".join(payload.get("ret", []))
+        if "SUCCESS" in ret.upper():
+            return True, ret
+        return False, ret or "未知返回"
+
     async def find_order(self, order_id: str) -> dict[str, Any] | None:
         """按订单号查卖家订单列表，拿到金额与状态。
 
@@ -645,12 +780,75 @@ class XianyuClient:
             if not item_id:
                 continue
             price_info = data.get("priceInfo") if isinstance(data.get("priceInfo"), dict) else {}
+            detail_params = data.get("detailParams") if isinstance(data.get("detailParams"), dict) else {}
             items.append({
                 "item_id": item_id,
                 "title": str(data.get("title") or ""),
                 "price": str(price_info.get("price") or ""),
+                # 多规格商品要再调 item_detail 才能拿到天卡/周卡/月卡的价格
+                "is_sku": str(detail_params.get("isSKU") or "") == "1",
+                "sold_price": str(detail_params.get("soldPrice") or price_info.get("price") or ""),
             })
         return items
+
+    async def item_detail(self, item_id: str) -> dict[str, Any]:
+        """拉单个商品的详情，重点是把多规格（SKU）的价格取出来。
+
+        列表接口只给最低价（soldPrice），所以「天卡/周卡/月卡」这类多规格商品
+        在列表里永远只看到一个价格。详情接口 `mtop.taobao.idle.pc.detail`
+        的 `data.itemDO.skuList[]` 才有每个规格：价格单位是分，必须 /100。
+        """
+        item_id = str(item_id or "").strip()
+        if not item_id:
+            raise XianyuError("item_id 不能为空")
+        resp = await self.mtop("mtop.taobao.idle.pc.detail", {"itemId": item_id})
+        ret = _ret_text(resp)
+        if "SUCCESS" not in ret.upper():
+            raise XianyuError("商品详情返回异常：" + (ret or "未知错误"))
+        item = ((resp.get("data") or {}).get("itemDO")) if isinstance(resp.get("data"), dict) else {}
+        if not isinstance(item, dict) or not item:
+            raise XianyuError("商品详情里没有 itemDO")
+
+        raw_skus = item.get("skuList")
+        if not isinstance(raw_skus, list):
+            raw_skus = item.get("idleItemSkuList")
+        skus: list[dict[str, Any]] = []
+        for raw in raw_skus or []:
+            if not isinstance(raw, dict):
+                continue
+            # 2018K 只需要「规格名 + 价格 + 天数」，但价格单位必须是元
+            try:
+                price_fen = float(raw.get("priceInCent") or raw.get("price") or 0)
+            except (TypeError, ValueError):
+                price_fen = 0.0
+            labels: list[str] = []
+            for prop in raw.get("propertyList") or []:
+                if not isinstance(prop, dict):
+                    continue
+                text = str(prop.get("valueText") or prop.get("actualValueText") or "").strip()
+                if text:
+                    labels.append(text)
+            label = " / ".join(labels)
+            if not label:
+                pairs = str((raw.get("features") or {}).get("idlePvPairs") or "")
+                label = pairs.split("#")[-1] if pairs else str(raw.get("skuId") or "")
+            try:
+                quantity = int(raw.get("quantity") or 0)
+            except (TypeError, ValueError):
+                quantity = 0
+            skus.append({
+                "sku_id": str(raw.get("skuId") or ""),
+                "label": label,
+                "price": round(price_fen / 100.0, 2),
+                "quantity": quantity,
+            })
+        return {
+            "item_id": str(item.get("itemId") or item_id),
+            "title": str(item.get("title") or ""),
+            "sold_price": str(item.get("soldPrice") or ""),
+            "is_sku": bool(skus),
+            "skus": skus,
+        }
 
     def dispatch(self, frame: dict[str, Any]) -> bool:
         """把「我们在等的回包」交给等待者，返回是否被消费。

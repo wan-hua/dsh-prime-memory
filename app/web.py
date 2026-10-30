@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+import re
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -14,11 +15,18 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from .autoreply import KINDS, MATCH_TYPES
-from .config import MODEL_LIMITS_KEY, resolved_model_limits, settings
-from .db import Database
+from .config import (
+    K2018Instance,
+    apply_saved_k2018_config,
+    apply_saved_social_config,
+    k2018_admin_ready,
+    k2018_ready,
+    settings,
+    social_any_enabled,
+)
+from .db import Database, now_iso
 from .qrlogin import STATUS_TEXT, LoginError, QrLoginManager, render_qr_png
 from .runner import WorkerManager
-from .upstream import normalize_model_limits
 
 logger = logging.getLogger(__name__)
 
@@ -32,18 +40,60 @@ class AccountIn(BaseModel):
     enabled: bool = True
 
 
+class K2018InstanceIn(BaseModel):
+    """面板里维护的一个 2018K 实例。"""
+
+    name: str = Field(min_length=1, max_length=32)
+    software_id: str = Field(min_length=32, max_length=32)
+
+
+class SocialConfigIn(BaseModel):
+    """订单自动化开关与评价内容。"""
+
+    auto_flower: bool = False
+    auto_remind_receipt: bool = False
+    auto_rate: bool = False
+    auto_receive_flower: bool = True
+    rate_content: str = Field(default="", max_length=500)
+
+
+class K2018ConfigIn(BaseModel):
+    """面板保存的 2018K 接入配置；密码/OpenId 留空表示保持原值。"""
+
+    openid: str = ""
+    instances: list[K2018InstanceIn] = Field(default_factory=list)
+    admin_username: str = ""
+    admin_password: str = ""
+    clear_admin: bool = False
+
+
+class PriceTierIn(BaseModel):
+    """多规格商品的一档：规格名 + 价格 + 卡密天数。"""
+
+    sku_id: str = Field(default="", max_length=64)
+    label: str = Field(default="", max_length=64)
+    price: float = Field(ge=0, le=1_000_000)
+    #: 0 = 永久卡（2018K 约定 day/hour/minute 全为 0）
+    days: int = Field(ge=0, le=36500)
+
+
 class RuleIn(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     item_id: str = "*"
     enabled: bool = True
-    mode: str = Field(default="text", pattern="^(text|card|upstream)$")
+    mode: str = Field(default="text", pattern="^(text|card|upstream|minidaily)$")
     content: str = ""
     auto_confirm: bool = False
     priority: int = 0
     remark: str = ""
-    #: 上游模式下：额度 = 订单金额 / cny_per_usd * usd_multiplier（fixed_usd > 0 时直接用）
-    usd_multiplier: float = 1.0
-    fixed_usd: float = 0.0
+    #: 2018K 模式：规则绑定哪个实例、卡密多少天
+    software_id: str = Field(default="", max_length=64)
+    #: fixed = 本商品固定天数；per_amount = 订单金额 × 每元天数；tiers = 规格档位
+    duration_mode: str = Field(default="fixed", pattern="^(fixed|per_amount|tiers)$")
+    fixed_days: int = Field(default=1, ge=0, le=36500)
+    days_per_cny: float = Field(default=1.0, gt=0, le=3650)
+    #: 多规格商品：天卡/周卡/月卡各自的价格与天数
+    price_tiers: list[PriceTierIn] = Field(default_factory=list)
 
 
 class ReplyRuleIn(BaseModel):
@@ -71,21 +121,36 @@ class LoginIn(BaseModel):
     remark: str = ""
 
 
-class SettingsIn(BaseModel):
-    """后台「设置」页里可改的项。
-
-    只放「改错了也不至于泄漏凭据」的东西：模型白名单这类运营参数。
-    凭据（access_token / 密码）仍然只从 .env 读，避免把密钥落进数据库。
-    """
-
-    #: 新建 Key 只允许使用的模型（逗号 / 中文逗号 / 空白分隔）。空串 = 不限制。
-    model_limits: str = Field(default="", max_length=2000)
-
-
 class CardsIn(BaseModel):
     item_id: str = "*"
     contents: list[str] = Field(default_factory=list)
     raw_text: str = ""
+
+
+def k2018_view() -> dict[str, Any]:
+    """2018K 对外展示状态：只给实例名/ID 后 8 位，不回显 OpenId 和密码。"""
+    return {
+        "ready": k2018_ready(),
+        "api_base": settings.k2018_api_base,
+        "openid_set": bool(settings.k2018_openid),
+        "admin_ready": k2018_admin_ready(),
+        "instances": [
+            {"name": item.name, "software_id": item.software_id, "tail": item.tail}
+            for item in settings.k2018_instances
+        ],
+    }
+
+
+def social_view() -> dict[str, Any]:
+    """订单自动化开关（不包含任何凭据）。"""
+    return {
+        "auto_flower": bool(settings.social_auto_flower),
+        "auto_remind_receipt": bool(settings.social_auto_remind),
+        "auto_rate": bool(settings.social_auto_rate),
+        "auto_receive_flower": bool(settings.social_auto_receive_flower),
+        "rate_content": settings.social_rate_content,
+        "since": settings.social_since,
+    }
 
 
 def create_app(db: Database | None = None, manager: WorkerManager | None = None) -> FastAPI:
@@ -94,6 +159,13 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await database.init()
+        # 面板保存过就以数据库为准；没有保存过则继续用 .env 的初始值
+        try:
+            saved = await database.get_all_config()
+            apply_saved_k2018_config({k: v for k, v in saved.items() if k.startswith("k2018_")})
+            apply_saved_social_config({k: v for k, v in saved.items() if k.startswith("social_")})
+        except Exception as exc:  # pragma: no cover - 数据库异常时不阻塞启动
+            logger.warning("读取 2018K 面板配置失败：%s", exc)
         mgr = manager or WorkerManager(database)
         app.state.manager = mgr
         await mgr.sync()
@@ -365,6 +437,32 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
         finally:
             await client.close()
 
+    @app.get("/api/accounts/{account_id}/items/{item_id}/skus", dependencies=guard)
+    async def item_skus(account_id: int, item_id: str) -> dict[str, Any]:
+        """拉一个商品的规格（天卡/周卡/月卡）与各自价格。
+
+        列表接口只给最低价，多规格必须走商品详情；价格在详情里是「分」，
+        client.item_detail 已经换算成元。
+        """
+        account = await database.get_account(account_id)
+        if account is None or not account["cookie"]:
+            raise HTTPException(status_code=404, detail="账号不存在或没有 Cookie")
+
+        from .client import CookieExpired, XianyuClient, XianyuError
+
+        try:
+            client = XianyuClient(account["cookie"])
+        except XianyuError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        try:
+            return await client.item_detail(item_id)
+        except CookieExpired as exc:
+            raise HTTPException(status_code=400, detail="Cookie 已失效，请重新扫码登录") from exc
+        except XianyuError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            await client.close()
+
     # -------------------------------------------------------------- 卡密
 
     @app.get("/api/cards", dependencies=guard)
@@ -400,100 +498,131 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
     async def list_messages(limit: int = 100) -> list[dict[str, Any]]:
         return await database.list_messages(limit)
 
+    @app.delete("/api/messages", dependencies=guard)
+    async def clear_messages() -> dict[str, int]:
+        """清空消息流水；只删 messages，不影响订单、规则和卡密。"""
+        return {"deleted": await database.clear_messages()}
+
     # -------------------------------------------------------------- 设置
 
-    async def _model_limits_state() -> dict[str, Any]:
-        """模型白名单的当前生效值 + 它从哪来（后台设置页 / .env / 内置默认）。"""
-        overrides = await database.get_all_config()
-        value = resolved_model_limits(overrides)
-        if MODEL_LIMITS_KEY in overrides:
-            source = "web"
-        elif settings.newapi_model_limits:
-            source = "env"
-        else:
-            source = "default"
-        return {
-            "value": value,
-            "normalized": normalize_model_limits(value),
-            "unlimited": not normalize_model_limits(value),
-            "source": source,
-        }
-
-    async def _site_currency() -> str:
-        """站点展示货币（USD / CNY / CUSTOM）。读不到就当 USD，保持老行为。"""
-        try:
-            from .upstream import NewApiClient
-
-            client = NewApiClient(
-                settings.newapi_base_url,
-                access_token=settings.newapi_session,
-                username=settings.newapi_username,
-                password=settings.newapi_password,
-                user_id=settings.newapi_user_id,
-            )
-            try:
-                model = await client.site_quota_model()
-                return model.currency
-            finally:
-                await client.close()
-        except Exception:
-            # 纯展示用：取不到不该让整个 /api/config 失败
-            logger.debug("读取站点货币失败，按 USD 展示", exc_info=True)
-            return "USD"
-
-    @app.get("/api/config/settings", dependencies=guard)
-    async def show_settings() -> dict[str, Any]:
-        """后台「设置」页的初始值。"""
-        return {"model_limits": await _model_limits_state()}
-
-    @app.put("/api/config/settings", dependencies=guard)
-    async def save_settings(payload: SettingsIn) -> dict[str, Any]:
-        """保存模型白名单。保存后立刻对新订单生效，不用重启、不用改 .env。
-
-        已经发出去的旧 Key 不受影响 —— 它们是建令牌时写进 new-api 的，
-        要收紧只能去 new-api 后台单个改（这一点前端有提示）。
-        """
-        normalized = normalize_model_limits(payload.model_limits)
-        await database.set_config(MODEL_LIMITS_KEY, normalized)
-        if not normalized:
-            logger.warning("后台把模型白名单清空了：之后新建的 Key 将不限制模型")
-        else:
-            logger.info("后台更新模型白名单：%s", normalized)
-        return {"ok": True, "model_limits": await _model_limits_state()}
-
     @app.get("/api/config", dependencies=guard)
-    async def show_config() -> dict[str, Any]:
-        """前端用来提示「上游是否已配好」，不回显任何密钥。"""
-        from .config import upstream_ready
-
-        limits = await _model_limits_state()
+    async def show_config(request: Request) -> dict[str, Any]:
+        """前端展示用的运行状态；只暴露实例名称/ID 后 8 位，不回显 OpenId 和后台密码。"""
+        k2018 = k2018_view()
+        health = getattr(mgr(request), "k2018_health", None)
+        if health is not None:
+            k2018["health"] = health()
+        else:
+            k2018["health"] = {"ok": None, "error": "", "checked_at": 0.0, "instances": []}
         return {
             "dry_run": settings.dry_run,
             "auto_reply": {
                 "enabled": settings.auto_reply_enabled,
                 "delay": settings.auto_reply_delay,
             },
-            "cny_per_usd": settings.cny_per_usd,
             "max_order_cny": settings.max_order_cny,
-            "newapi": {
-                "base_url": settings.newapi_base_url,
-                "has_credential": bool(settings.newapi_session or (settings.newapi_username and settings.newapi_password)),
-                "group": settings.newapi_group,
-                # 站点计价货币：CNY 时「额度」是人民币，前端别一律写 $
-                "currency": await _site_currency(),
-                # 生效值（后台设置优先，其次 .env），前端横幅直接用它
-                "model_limits": limits["value"],
-                "model_limits_source": limits["source"],
-                "model_limits_unlimited": limits["unlimited"],
-            },
-            "cardshop": {
-                "base_url": settings.cardshop_base_url,
-                "has_token": bool(settings.cardshop_admin_token),
-                "has_password_login": bool(settings.cardshop_username and settings.cardshop_password),
-            },
-            "newapi_user_id_set": bool(settings.newapi_user_id),
-            "upstream_ready": upstream_ready(),
+            "k2018": k2018,
+            "social": social_view(),
         }
+
+    @app.post("/api/k2018/check", dependencies=guard)
+    async def check_k2018_health(request: Request) -> dict[str, Any]:
+        """手动检测 2018K 连接；不会启动定时轮询。"""
+        manager = mgr(request)
+        checker = getattr(manager, "check_k2018_health", None)
+        if checker is not None:
+            return await checker()
+        health = getattr(manager, "k2018_health", None)
+        if health is not None:
+            return health()
+        return {"ok": None, "error": "", "checked_at": 0.0, "instances": []}
+
+    @app.put("/api/config/social", dependencies=guard)
+    async def save_social_config(payload: SocialConfigIn) -> dict[str, Any]:
+        """保存订单自动化开关；默认全部关闭，开启时只处理之后的新订单。"""
+        was_any = social_any_enabled()
+        now_any = bool(
+            payload.auto_flower
+            or payload.auto_remind_receipt
+            or payload.auto_rate
+            or payload.auto_receive_flower
+        )
+        settings.social_auto_flower = bool(payload.auto_flower)
+        settings.social_auto_remind = bool(payload.auto_remind_receipt)
+        settings.social_auto_rate = bool(payload.auto_rate)
+        settings.social_auto_receive_flower = bool(payload.auto_receive_flower)
+        settings.social_rate_content = (payload.rate_content or "").strip()[:500]
+        if now_any and (not was_any or not settings.social_since):
+            settings.social_since = now_iso()
+        values = {
+            "social_auto_flower": "1" if settings.social_auto_flower else "0",
+            "social_auto_remind": "1" if settings.social_auto_remind else "0",
+            "social_auto_rate": "1" if settings.social_auto_rate else "0",
+            "social_auto_receive_flower": "1" if settings.social_auto_receive_flower else "0",
+            "social_rate_content": settings.social_rate_content,
+            "social_since": settings.social_since,
+        }
+        for key, value in values.items():
+            await database.set_config(key, value)
+        return social_view()
+
+    @app.put("/api/config/k2018", dependencies=guard)
+    async def save_k2018_config(payload: K2018ConfigIn, request: Request) -> dict[str, Any]:
+        """面板保存 2018K 接入配置：OpenId、实例增删、可选后台账号。"""
+        openid = payload.openid.strip() or settings.k2018_openid
+        if not re.fullmatch(r"[0-9a-fA-F]{32}", openid or ""):
+            raise HTTPException(status_code=400, detail="OpenId 必须是 32 位十六进制字符串")
+
+        instances: list[K2018Instance] = []
+        seen_names: set[str] = set()
+        seen_ids: set[str] = set()
+        for item in payload.instances:
+            name = item.name.strip()
+            software_id = item.software_id.strip().upper()
+            if not name:
+                raise HTTPException(status_code=400, detail="实例名不能为空")
+            if re.search(r"[,=;|\n]", name):
+                raise HTTPException(status_code=400, detail="实例名不能包含逗号、等号、分号或竖线")
+            if not re.fullmatch(r"[0-9A-F]{32}", software_id):
+                raise HTTPException(status_code=400, detail=f"实例「{name}」的 softwareId 不是 32 位十六进制")
+            if name.casefold() in seen_names:
+                raise HTTPException(status_code=400, detail=f"实例名重复：{name}")
+            if software_id in seen_ids:
+                raise HTTPException(status_code=400, detail=f"softwareId 重复：{software_id}")
+            seen_names.add(name.casefold())
+            seen_ids.add(software_id)
+            instances.append(K2018Instance(name=name, software_id=software_id))
+
+        if payload.clear_admin:
+            admin_username = ""
+            admin_password = ""
+        else:
+            admin_username = payload.admin_username.strip() or settings.k2018_admin_username
+            admin_password = payload.admin_password or settings.k2018_admin_password
+            if bool(admin_username) != bool(admin_password):
+                raise HTTPException(
+                    status_code=400,
+                    detail="后台账号和密码必须同时填写；不用自动删卡可以都留空",
+                )
+
+        values = {
+            "k2018_openid": openid,
+            "k2018_instances": ",".join(f"{i.name}={i.software_id}" for i in instances),
+            "k2018_admin_username": admin_username,
+            "k2018_admin_password": admin_password,
+        }
+        for key, value in values.items():
+            await database.set_config(key, value)
+        apply_saved_k2018_config(values)
+
+        # 让已经跑着的 worker 也换到新实例/新账号；换完再关旧连接
+        reload = getattr(mgr(request), "reload_k2018", None)
+        if reload is not None:
+            try:
+                await reload()
+            except Exception as exc:  # pragma: no cover - 配置已落库，重载失败要能看见
+                logger.error("重载 2018K 配置失败：%s", exc)
+        return {"ok": True, "k2018": k2018_view()}
 
     @app.get("/api/status", dependencies=guard)
     async def worker_status(request: Request) -> list[dict[str, Any]]:
